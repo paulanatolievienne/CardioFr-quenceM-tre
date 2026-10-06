@@ -1,0 +1,100 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define LARGEUR_ECRAN 128
+#define HAUTEUR_ECRAN 64
+
+const int LED_ROUGE = 2;
+const int LED_VERTE = 3;
+const int LED_JAUNE = 4;
+
+Adafruit_SSD1306 ecran(LARGEUR_ECRAN, HAUTEUR_ECRAN, &Wire, -1);
+
+// Dessine un petit cœur centré en (x, y), de rayon "taille"
+void dessinerCoeur(int16_t x, int16_t y, uint8_t taille) {
+  int16_t r = taille / 2;
+  ecran.fillCircle(x - r, y, r, SSD1306_WHITE);
+  ecran.fillCircle(x + r, y, r, SSD1306_WHITE);
+  ecran.fillTriangle(x - taille, y, x + taille, y, x, y + taille, SSD1306_WHITE);
+}
+
+// Affiche le chiffre à gauche et le cœur (qui bat) en haut à droite
+void afficherEcran(int valeur, uint8_t tailleCoeur) {
+  char texte[5];
+  snprintf(texte, sizeof(texte), "%d", valeur);
+
+  ecran.clearDisplay();
+
+  ecran.setTextSize(4);
+  ecran.setTextColor(SSD1306_WHITE);
+  int16_t x1, y1;
+  uint16_t largeurTexte, hauteurTexte;
+  ecran.getTextBounds(texte, 0, 0, &x1, &y1, &largeurTexte, &hauteurTexte);
+  ecran.setCursor(10, (HAUTEUR_ECRAN - hauteurTexte) / 2);
+  ecran.println(texte);
+
+  dessinerCoeur(108, 16, tailleCoeur);
+
+  ecran.display();
+}
+
+// Affiche une valeur pendant dureeMs, avec le cœur qui bat pendant ce temps
+void afficherAvecBattement(int valeur, unsigned long dureeMs) {
+  unsigned long fin = millis() + dureeMs;
+  bool grand = true;
+  while (millis() < fin) {
+    afficherEcran(valeur, grand ? 10 : 6);
+    grand = !grand;
+    delay(grand ? 350 : 150); // battement : pulsation courte, pause plus longue
+  }
+}
+
+// LED RGB à anode commune : LOW allume une couleur, HIGH l'éteint.
+void mettreAJourLeds(int valeur) {
+  digitalWrite(LED_ROUGE, HIGH);
+  digitalWrite(LED_VERTE, HIGH);
+  digitalWrite(LED_JAUNE, HIGH);
+
+  if (valeur > 100) {
+    digitalWrite(LED_ROUGE, LOW);
+  } else if (valeur < 80) {
+    digitalWrite(LED_VERTE, LOW);
+  } else {
+    digitalWrite(LED_JAUNE, LOW); // entre 80 et 100
+  }
+}
+
+void setup() {
+  pinMode(LED_ROUGE, OUTPUT);
+  pinMode(LED_VERTE, OUTPUT);
+  pinMode(LED_JAUNE, OUTPUT);
+
+  if (!ecran.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    // Écran non détecté : clignotement rapide en continu pour signaler l'erreur
+    while (true) {
+      digitalWrite(LED_ROUGE, LOW);
+      delay(100);
+      digitalWrite(LED_ROUGE, HIGH);
+      delay(100);
+    }
+  }
+}
+
+void loop() {
+  // Démonstration : on fait défiler trois valeurs pour voir les trois couleurs.
+  // Remplacez ces valeurs par la lecture de votre capteur quand il sera prêt.
+
+  int valeur = 60; // < 80 -> vert
+  mettreAJourLeds(valeur);
+  afficherAvecBattement(valeur, 2000);
+
+  valeur = 90; // entre 80 et 100 -> jaune
+  mettreAJourLeds(valeur);
+  afficherAvecBattement(valeur, 2000);
+
+  valeur = 120; // > 100 -> rouge
+  mettreAJourLeds(valeur);
+  afficherAvecBattement(valeur, 2000);
+}
