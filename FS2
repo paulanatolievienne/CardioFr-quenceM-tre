@@ -1,0 +1,28 @@
+#include <DS1302.h>
+
+// Initialisation du module DS1302 : (RST, DAT, CLK)
+DS1302 myRTC(8, 7, 6);
+
+void setup() {
+  // Démarrage de la liaison série pour afficher l'heure sur le moniteur série
+  Serial.begin(9600);
+
+  // Initialisation de l'horloge
+  myRTC.halt(false);
+  myRTC.writeProtect(false);
+
+  // --- DÉCOMMENTEZ LA LIGNE CI-DESSOUS UNIQUEMENT POUR RÉGLER L'HEURE LA PREMIÈRE FOIS ---
+  // Format : (heure, minute, seconde, jour, mois, année)
+  // myRTC.setTime(14, 32, 0, 6, 10, 2026);
+}
+
+void loop() {
+  // Affichage de l'heure actuelle sur le moniteur série
+  Serial.print("Heure actuelle : ");
+  Serial.print(myRTC.getTimeStr());
+  Serial.print(" | Date : ");
+  Serial.println(myRTC.getDateStr());
+
+  // Attente d'une seconde avant la prochaine lecture
+  delay(1000);
+}
