@@ -1,0 +1,36 @@
+const int buzzerPin = 9;
+const int buttonPin = 2;
+
+bool buzzerState = false;         // État du buzzer (éteint par défaut)
+bool lastButtonState = HIGH;      // État précédent du bouton (Pull-Up)
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 50; // Délai anti-rebond en ms
+
+void setup() {
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(buttonPin, INPUT_PULLUP); // Active la résistance de tirage interne
+}
+
+void loop() {
+  int reading = digitalRead(buttonPin);
+
+  // Gestion de l'anti-rebond
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    // Si l'état du bouton change durablement
+    if (reading == LOW) { // Appui détecté (LOW car Pull-Up)
+      buzzerState = !buzzerState; // On inverse l'état (on <-> off)
+    }
+  }
+  lastButtonState = reading;
+
+  // Application de l'état : si activé, on émet le son, sinon on coupe
+  if (buzzerState) {
+    tone(buzzerPin, 1000); // Son modéré à 1000 Hz (correspond à FS4)
+  } else {
+    noTone(buzzerPin);     // Coupure immédiate (faible latence)
+  }
+}
