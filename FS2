@@ -1,28 +1,73 @@
-#include <DS1302.h>
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Ds1302.h>
 
-// Initialisation du module DS1302 : (RST, DAT, CLK)
-DS1302 myRTC(8, 7, 6);
+#define LARGEUR_ECRAN 128
+#define HAUTEUR_ECRAN 64
+
+const int RST_PIN = 8;
+const int DAT_PIN = 7;
+const int CLK_PIN = 6;
+
+// Constructeur de cette bibliothèque : (ena/RST, clk, dat)
+Ds1302 myRTC(RST_PIN, CLK_PIN, DAT_PIN);
+
+Adafruit_SSD1306 ecran(LARGEUR_ECRAN, HAUTEUR_ECRAN, &Wire, -1);
 
 void setup() {
-  // Démarrage de la liaison série pour afficher l'heure sur le moniteur série
   Serial.begin(9600);
+  myRTC.init();
 
-  // Initialisation de l'horloge
-  myRTC.halt(false);
-  myRTC.writeProtect(false);
+  if (!ecran.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("Ecran non detecte (verifiez le cablage SDA/SCL et l'adresse I2C)");
+    while (true) {
+      delay(1000);
+    }
+  }
 
-  // --- DÉCOMMENTEZ LA LIGNE CI-DESSOUS UNIQUEMENT POUR RÉGLER L'HEURE LA PREMIÈRE FOIS ---
-  // Format : (heure, minute, seconde, jour, mois, année)
-  // myRTC.setTime(14, 32, 0, 6, 10, 2026);
+  // --- DÉCOMMENTEZ LE BLOC CI-DESSOUS UNIQUEMENT POUR RÉGLER L'HEURE (ajustez hour/minute/second
+  // à l'heure actuelle avant de téléverser, puis REMETTEZ CE BLOC EN COMMENTAIRE et reflashez) ---
+  // Ds1302::DateTime dt;
+  // dt.year = 26;   // 2026
+  // dt.month = 10;
+  // dt.day = 6;
+  // dt.hour = 12;   // <-- à corriger avec l'heure réelle
+  // dt.minute = 0;  // <-- à corriger avec l'heure réelle
+  // dt.second = 0;
+  // dt.dow = Ds1302::DOW_TUE;
+  // myRTC.setDateTime(&dt);
 }
 
 void loop() {
-  // Affichage de l'heure actuelle sur le moniteur série
-  Serial.print("Heure actuelle : ");
-  Serial.print(myRTC.getTimeStr());
-  Serial.print(" | Date : ");
-  Serial.println(myRTC.getDateStr());
+  Ds1302::DateTime dt;
+  myRTC.getDateTime(&dt);
 
-  // Attente d'une seconde avant la prochaine lecture
+  char texteHeure[9];
+  snprintf(texteHeure, sizeof(texteHeure), "%02d:%02d:%02d", dt.hour, dt.minute, dt.second);
+
+  char texteDate[11];
+  snprintf(texteDate, sizeof(texteDate), "%02d/%02d/%04d", dt.day, dt.month, 2000 + dt.year);
+
+  ecran.clearDisplay();
+
+  ecran.setTextSize(2);
+  ecran.setTextColor(SSD1306_WHITE);
+  ecran.setCursor(10, 20);
+  ecran.println(texteHeure);
+
+  ecran.setTextSize(1);
+  ecran.setCursor(20, 45);
+  ecran.println(texteDate);
+
+  ecran.display();
+
+  // Affichage de l'heure actuelle sur le moniteur série aussi
+  Serial.print("Heure actuelle : ");
+  Serial.print(texteHeure);
+  Serial.print(" | Date : ");
+  Serial.println(texteDate);
+
   delay(1000);
 }
