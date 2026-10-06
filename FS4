@@ -1,17 +1,65 @@
 #include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
-const int bouton = 2;
-const int buzzer = 5;
+const int buzzer = 2;
+
+// --- Écran OLED SSD1306 (I2C) ---
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1       // pas de broche reset dédiée sur la plupart des modules I2C
+#define SCREEN_ADDRESS 0x3C // à ajuster selon votre module (0x3C ou 0x3D)
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// --- Niveaux de rythme cardiaque ---
+const int nbNiveaux = 3;
+const int bpmNiveaux[nbNiveaux] = {60, 100, 120};
+const int frequenceNiveaux[nbNiveaux] = {440, 1000, 2000}; // grave, moyen, aigu
+int niveauActuel = 0;
+
+const unsigned long dureeBip = 100; // ms de bip audible
+
+unsigned long dernierBattement = 0;
+unsigned long periode = 60000UL / bpmNiveaux[niveauActuel];
+
+// --- Défilement automatique des niveaux ---
+const unsigned long intervalleDefilement = 5000; // ms entre chaque niveau
+unsigned long dernierDefilement = 0;
+
+void afficherRythme() {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Rythme:");
+  display.setCursor(0, 30);
+  display.print(bpmNiveaux[niveauActuel]);
+  display.println(" BPM");
+  display.display();
+}
 
 void setup() {
-  pinMode(bouton, INPUT_PULLUP);
   pinMode(buzzer, OUTPUT);
+
+  display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
+  afficherRythme();
 }
 
 void loop() {
-  if (digitalRead(bouton) == LOW) {
-    tone(buzzer, 1000);  // Buzzer à 1000 Hz
-  } else {
-    noTone(buzzer);      // Arrête le buzzer
+  unsigned long maintenant = millis();
+
+  // Défilement automatique des niveaux toutes les 5 secondes
+  if (maintenant - dernierDefilement >= intervalleDefilement) {
+    dernierDefilement = maintenant;
+    niveauActuel = (niveauActuel + 1) % nbNiveaux;
+    periode = 60000UL / bpmNiveaux[niveauActuel];
+    afficherRythme();
+  }
+
+  // Battement du buzzer au rythme et à la fréquence du niveau sélectionné
+  if (maintenant - dernierBattement >= periode) {
+    dernierBattement = maintenant;
+    tone(buzzer, frequenceNiveaux[niveauActuel], dureeBip);
   }
 }
