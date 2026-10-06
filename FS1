@@ -1,0 +1,144 @@
+#include <Arduino.h>
+
+const int CAPTEUR_PPG = A0;
+
+// Fréquence d'échantillonnage
+const unsigned long PERIODE_ECHANTILLON = 10000; // 10 ms = 100 Hz
+
+// Variables de traitement
+float baseline = 0;
+float signalFiltre = 0;
+float amplitude = 20;
+
+// Détection des pics
+float signalPrecedent = 0;
+float signalAvant = 0;
+
+unsigned long dernierBattement = 0;
+float bpm = 0;
+
+// Temps minimum entre deux battements
+const unsigned long REFRACTAIRE = 300000; // 300 ms
+
+void setup() {
+
+    Serial.begin(115200);
+
+    // Première mesure pour initialiser la moyenne
+    int mesure = analogRead(CAPTEUR_PPG);
+    baseline = mesure;
+
+    Serial.println("PPG START");
+}
+
+void loop() {
+
+    static unsigned long dernierEchantillon = 0;
+
+    unsigned long maintenant = micros();
+
+    // Echantillonnage à 100 Hz
+    if (maintenant - dernierEchantillon >= PERIODE_ECHANTILLON) {
+
+        dernierEchantillon = maintenant;
+
+        // ------------------------------------------------
+        // 1. Lecture du capteur
+        // ------------------------------------------------
+
+        int mesure = analogRead(CAPTEUR_PPG);
+
+
+        // ------------------------------------------------
+        // 2. Suppression de la composante continue
+        // ------------------------------------------------
+        // On estime lentement la valeur moyenne du signal.
+
+        baseline = 0.99 * baseline + 0.01 * mesure;
+
+        float signal = mesure - baseline;
+
+
+        // ------------------------------------------------
+        // 3. Filtrage léger
+        // ------------------------------------------------
+
+        signalFiltre = 0.7 * signalFiltre + 0.3 * signal;
+
+
+        // ------------------------------------------------
+        // 4. Estimation de l'amplitude du signal
+        // ------------------------------------------------
+
+        amplitude = 0.995 * amplitude + 0.005 * abs(signalFiltre);
+
+        float seuil = amplitude * 1.5;
+
+
+        // ------------------------------------------------
+        // 5. Détection d'un pic
+        // ------------------------------------------------
+
+        bool pic = false;
+
+        if (signalAvant < signalPrecedent &&
+            signalPrecedent > signalFiltre &&
+            signalPrecedent > seuil) {
+
+            unsigned long tempsPic = maintenant - 10000;
+
+            if (tempsPic - dernierBattement > REFRACTAIRE) {
+
+                pic = true;
+
+                // ----------------------------------------
+                // 6. Calcul de la fréquence cardiaque
+                // ----------------------------------------
+
+                if (dernierBattement != 0) {
+
+                    unsigned long periode =
+                        tempsPic - dernierBattement;
+
+                    bpm = 60000000.0 / periode;
+
+                    // Sécurité : fréquence physiologiquement
+                    // plausible pour notre test
+                    if (bpm < 30 || bpm > 220) {
+                        bpm = 0;
+                    }
+                }
+
+                dernierBattement = tempsPic;
+            }
+        }
+
+
+        // Mise à jour des anciennes valeurs
+        signalAvant = signalPrecedent;
+        signalPrecedent = signalFiltre;
+
+
+        // ------------------------------------------------
+        // 7. Affichage pour Serial Plotter
+        // ------------------------------------------------
+
+        Serial.print(signalFiltre);
+        Serial.print("\t");
+
+        Serial.print(seuil);
+        Serial.print("\t");
+
+        // marqueur visuel lorsqu'un battement est détecté
+        if (pic) {
+            Serial.print(seuil * 2);
+        }
+        else {
+            Serial.print(0);
+        }
+
+        Serial.print("\t");
+
+        Serial.println(bpm);
+    }
+}
