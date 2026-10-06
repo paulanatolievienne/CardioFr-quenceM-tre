@@ -1,1 +1,17 @@
+#include <Arduino.h>
 
+const int bouton = 2;
+const int buzzer = 5;
+
+void setup() {
+  pinMode(bouton, INPUT_PULLUP);
+  pinMode(buzzer, OUTPUT);
+}
+
+void loop() {
+  if (digitalRead(bouton) == LOW) {
+    tone(buzzer, 1000);  // Buzzer à 1000 Hz
+  } else {
+    noTone(buzzer);      // Arrête le buzzer
+  }
+}
