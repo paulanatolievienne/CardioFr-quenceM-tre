@@ -1,1 +1,129 @@
+#include <Arduino.h>
+#include <unity.h>
 
+// Broches
+const int pinA = 2;  // Interruption INT0
+const int pinB = 3;  // Interruption INT1
+const int pinSW = 4; // Clic encodeur (S1)
+
+// Logique isolée pour décodage et tests unitaires
+struct EncoderController {
+  volatile long position = 0;
+  bool lastButtonState = HIGH;
+  bool buttonPressed = false;
+  unsigned long lastDebounceTime = 0;
+  const unsigned long debounceDelay = 50;
+
+  // Décodage quadrature (appelé sur interruption du canal A)
+  void processStep(int stateA, int stateB) {
+    if (stateA != stateB) {
+      position++;
+    } else {
+      position--;
+    }
+  }
+
+  // Dérebond du bouton intégré
+  bool updateButton(int rawReading, unsigned long currentTime) {
+    bool clicked = false;
+    if (rawReading != lastButtonState) {
+      lastDebounceTime = currentTime;
+    }
+
+    if ((currentTime - lastDebounceTime) >= debounceDelay) {
+      if (rawReading == LOW && !buttonPressed) {
+        buttonPressed = true;
+        clicked = true;
+      } else if (rawReading == HIGH) {
+        buttonPressed = false;
+      }
+    }
+    lastButtonState = rawReading;
+    return clicked;
+  }
+};
+
+EncoderController encoder;
+
+// Routine d'interruption matérielle
+void IRAM_ATTR isrPinA() {
+  int stateA = digitalRead(pinA);
+  int stateB = digitalRead(pinB);
+  encoder.processStep(stateA, stateB);
+}
+
+// --- TESTS UNITAIRES (UNITY) ---
+EncoderController testEncoder;
+
+void setUp(void) {
+  testEncoder = EncoderController();
+}
+
+void tearDown(void) {}
+
+void test_encoder_rotates_clockwise(void) {
+  // Sens horaire : canal A change et diffère de B
+  testEncoder.processStep(LOW, HIGH);
+  TEST_ASSERT_EQUAL(1, testEncoder.position);
+}
+
+void test_encoder_rotates_counter_clockwise(void) {
+  // Sens anti-horaire : canal A identique à B
+  testEncoder.processStep(LOW, LOW);
+  TEST_ASSERT_EQUAL(-1, testEncoder.position);
+}
+
+void test_button_debounce_ignores_spike(void) {
+  testEncoder.updateButton(LOW, 0);
+  testEncoder.updateButton(HIGH, 20); // Rebond < 50ms
+  TEST_ASSERT_FALSE(testEncoder.buttonPressed);
+}
+
+void test_button_triggers_on_valid_press(void) {
+  testEncoder.updateButton(LOW, 0);
+  bool clicked = testEncoder.updateButton(LOW, 60); // Validé > 50ms
+  TEST_ASSERT_TRUE(clicked);
+  TEST_ASSERT_TRUE(testEncoder.buttonPressed);
+}
+
+void runUnitTests() {
+  UNITY_BEGIN();
+  RUN_TEST(test_encoder_rotates_clockwise);
+  RUN_TEST(test_encoder_rotates_counter_clockwise);
+  RUN_TEST(test_button_debounce_ignores_spike);
+  RUN_TEST(test_button_triggers_on_valid_press);
+  UNITY_END();
+}
+
+// --- SETUP & LOOP ---
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(pinA, INPUT_PULLUP);
+  pinMode(pinB, INPUT_PULLUP);
+  pinMode(pinSW, INPUT_PULLUP);
+
+  // Attachement de l'interruption sur front descendant de A
+  attachInterrupt(digitalPinToInterrupt(pinA), isrPinA, FALLING);
+
+  delay(1500);
+  runUnitTests();
+}
+
+void loop() {
+  unsigned long now = millis();
+  int rawBtn = digitalRead(pinSW);
+  bool btnClicked = encoder.updateButton(rawBtn, now);
+
+  if (btnClicked) {
+    encoder.position = 0; // Réinitialise la position au clic
+  }
+
+  // Envoi télémétrie Teleplot (50 Hz)
+  static unsigned long lastTeleplot = 0;
+  if (now - lastTeleplot >= 20) {
+    lastTeleplot = now;
+    Serial.printf(">position:%ld\n", encoder.position);
+    Serial.printf(">bouton:%d\n", encoder.buttonPressed ? 1 : 0);
+  }
+}
