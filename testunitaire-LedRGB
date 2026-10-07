@@ -1,0 +1,41 @@
+#include <Arduino.h>
+
+const byte redPin = 2;
+const byte greenPin = 3;
+const byte bluePin = 4;
+
+const byte ledPins[] = {redPin, greenPin, bluePin};
+const unsigned long colorDuration = 500;
+const unsigned long pauseDuration = 150;
+
+byte sequenceStep = 0;
+unsigned long lastStepTime = 0;
+
+void showColor(byte colorIndex) {
+  digitalWrite(redPin, LOW);
+  digitalWrite(greenPin, LOW);
+  digitalWrite(bluePin, LOW);
+
+  if (colorIndex < 3) {
+    digitalWrite(ledPins[colorIndex], HIGH);
+  }
+}
+
+void setup() {
+  pinMode(redPin, OUTPUT);
+  pinMode(greenPin, OUTPUT);
+  pinMode(bluePin, OUTPUT);
+  showColor(sequenceStep);
+}
+
+void loop() {
+  const unsigned long now = millis();
+  const unsigned long stepDuration =
+      sequenceStep % 2 == 0 ? colorDuration : pauseDuration;
+
+  if (now - lastStepTime >= stepDuration) {
+    lastStepTime = now;
+    sequenceStep = (sequenceStep + 1) % 6;
+    showColor(sequenceStep / 2);
+  }
+}
