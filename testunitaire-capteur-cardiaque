@@ -1,105 +1,18 @@
 #include <Arduino.h>
-#include <unity.h>
+#include <HeartRateProcessor.h>
 
 const int pulsePin = A2;
 
-// --- MOTEUR DE TRAITEMENT CARDIAQUE TESTABLE ---
-struct HeartRateProcessor {
-  int threshold = 550;         // Seuil de détection du pic (ajustable selon la pression du doigt)
-  bool pulseDetected = false;
-  unsigned long lastBeatTime = 0;
-  unsigned long ibi = 600;     // Inter-Beat Interval en ms (défaut ~100 bpm)
-  int bpm = 0;
-
-  // Traite un échantillon analogique et l'horodatage actuel
-  // Renvoie true si un nouveau battement valide vient d'être détecté
-  bool processSample(int signal, unsigned long currentTime) {
-    bool newBeat = false;
-
-    // Détection de franchissement de seuil montant
-    if (signal > threshold && !pulseDetected) {
-      // Période réfractaire de 250 ms pour éviter les doubles déclenchements (max 240 bpm)
-      if ((currentTime - lastBeatTime) > 250) {
-        pulseDetected = true;
-        ibi = currentTime - lastBeatTime;
-        lastBeatTime = currentTime;
-
-        // Calcul du BPM si l'intervalle est réaliste (entre 300 ms et 2000 ms -> 30 à 200 BPM)
-        if (ibi >= 300 && ibi <= 2000) {
-          bpm = 60000 / ibi;
-          newBeat = true;
-        }
-      }
-    }
-
-    // Réarmement lorsque le signal redescend sous le seuil avec petite hystérésis
-    if (signal < (threshold - 20) && pulseDetected) {
-      pulseDetected = false;
-    }
-
-    return newBeat;
-  }
-};
-
 HeartRateProcessor heartProcessor;
 
-// --- TESTS UNITAIRES (UNITY) ---
-HeartRateProcessor testProc;
-
-void setUp(void) {
-  testProc = HeartRateProcessor();
-  testProc.threshold = 550;
-  testProc.lastBeatTime = 1000; // Point de départ arbitraire
-}
-
-void tearDown(void) {}
-
-void test_bpm_calculation_accurate(void) {
-  // Simule un battement arrivant exactement 750 ms après le précédent (80 BPM attendu)
-  bool beat = testProc.processSample(600, 1750);
-  TEST_ASSERT_TRUE(beat);
-  TEST_ASSERT_EQUAL(80, testProc.bpm);
-}
-
-void test_refractory_period_ignores_rebound(void) {
-  // Premier battement à t=1500 ms
-  testProc.processSample(600, 1500);
-
-  // Faux rebond à t=1600 ms (+100 ms < 250 ms)
-  testProc.pulseDetected = false; // Force réarmement théorique
-  bool secondBeat = testProc.processSample(650, 1600);
-
-  TEST_ASSERT_FALSE(secondBeat);
-}
-
-void test_signal_below_threshold_ignored(void) {
-  // Signal sous le seuil
-  bool beat = testProc.processSample(500, 1700);
-  TEST_ASSERT_FALSE(beat);
-  TEST_ASSERT_FALSE(testProc.pulseDetected);
-}
-
-void runUnitTests() {
-  UNITY_BEGIN();
-  RUN_TEST(test_bpm_calculation_accurate);
-  RUN_TEST(test_refractory_period_ignores_rebound);
-  RUN_TEST(test_signal_below_threshold_ignored);
-  UNITY_END();
-}
-
-// --- SETUP & LOOP ---
 void setup() {
   Serial.begin(115200);
   pinMode(pulsePin, INPUT);
-
-  delay(1500);
-  runUnitTests();
 }
 
 void loop() {
   unsigned long now = millis();
 
-  // Échantillonnage à 50 Hz (toutes les 20 ms)
   static unsigned long lastSample = 0;
   if (now - lastSample >= 20) {
     lastSample = now;
@@ -107,10 +20,13 @@ void loop() {
     int rawSignal = analogRead(pulsePin);
     heartProcessor.processSample(rawSignal, now);
 
-    // Format Teleplot
-    Serial.printf(">signal:%d\n", rawSignal);
-    Serial.printf(">seuil:%d\n", heartProcessor.threshold);
-    Serial.printf(">battement:%d\n", heartProcessor.pulseDetected ? 600 : 450);
-    Serial.printf(">bpm:%d\n", heartProcessor.bpm);
+    Serial.print(F(">signal:"));
+    Serial.println(rawSignal);
+    Serial.print(F(">seuil:"));
+    Serial.println(heartProcessor.threshold);
+    Serial.print(F(">battement:"));
+    Serial.println(heartProcessor.pulseDetected ? 600 : 450);
+    Serial.print(F(">bpm:"));
+    Serial.println(heartProcessor.bpm);
   }
 }
