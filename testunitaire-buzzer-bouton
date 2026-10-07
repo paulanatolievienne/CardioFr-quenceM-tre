@@ -1,36 +1,41 @@
+#include <Arduino.h>
+#include <ButtonBuzzerController.h>
+
+// Broches matérielles
 const int buzzerPin = 9;
 const int buttonPin = 2;
 
-bool buzzerState = false;         // État du buzzer (éteint par défaut)
-bool lastButtonState = HIGH;      // État précédent du bouton (Pull-Up)
-unsigned long lastDebounceTime = 0;
-unsigned long debounceDelay = 50; // Délai anti-rebond en ms
+ButtonBuzzerController controller;
 
+// --- SETUP & LOOP ---
 void setup() {
+  Serial.begin(115200);
   pinMode(buzzerPin, OUTPUT);
-  pinMode(buttonPin, INPUT_PULLUP); // Active la résistance de tirage interne
+  pinMode(buttonPin, INPUT_PULLUP);
 }
 
 void loop() {
-  int reading = digitalRead(buttonPin);
+  int rawBtn = digitalRead(buttonPin);
+  unsigned long now = millis();
 
-  // Gestion de l'anti-rebond
-  if (reading != lastButtonState) {
-    lastDebounceTime = millis();
-  }
+  controller.update(rawBtn, now);
 
-  if ((millis() - lastDebounceTime) > debounceDelay) {
-    // Si l'état du bouton change durablement
-    if (reading == LOW) { // Appui détecté (LOW car Pull-Up)
-      buzzerState = !buzzerState; // On inverse l'état (on <-> off)
-    }
-  }
-  lastButtonState = reading;
-
-  // Application de l'état : si activé, on émet le son, sinon on coupe
-  if (buzzerState) {
-    tone(buzzerPin, 1000); // Son modéré à 1000 Hz (correspond à FS4)
+  if (controller.buzzerState) {
+    tone(buzzerPin, 1000);
   } else {
-    noTone(buzzerPin);     // Coupure immédiate (faible latence)
+    noTone(buzzerPin);
+  }
+
+  // Trames Teleplot cadencées à 50 Hz
+  static unsigned long lastTeleplot = 0;
+  if (now - lastTeleplot >= 20) {
+    lastTeleplot = now;
+    // Format Teleplot : 1 quand pressé/actif, 0 sinon
+    Serial.print(F(">btn_brut:"));
+    Serial.println(rawBtn == LOW ? 1 : 0);
+    Serial.print(F(">btn_filtre:"));
+    Serial.println(controller.stableState == LOW ? 1 : 0);
+    Serial.print(F(">buzzer:"));
+    Serial.println(controller.buzzerState ? 1 : 0);
   }
 }
