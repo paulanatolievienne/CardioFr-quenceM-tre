@@ -4,444 +4,877 @@
 #include <ThreeWire.h>
 #include <EEPROM.h>
 
-// ======================== ATTRIBUTION DES BROCHES ========================
-// Écrans OLED (Software I2C / Bit-Bang U8g2)
+// ============================================================
+// PINS
+// ============================================================
+
 #define OLED1_SCL A4
 #define OLED1_SDA A3
 #define OLED2_SCL A2
 #define OLED2_SDA A1
 
-// Encodeur rotatif
-// C -> GND, A -> D10, B -> D12, S2 -> D11, S1 -> GND
 const int pinEncA  = 10;
 const int pinEncB  = 12;
 const int pinEncSW = 11;
 
-// RTC DS1302
 const int rtcRST = 2;
 const int rtcDAT = 3;
 const int rtcCLK = 4;
 
-// Actionneurs
 const int buzzerPin = 5;
-const int ledYellow = 6; // Rythme faible (< 60 bpm)
-const int ledGreen  = 7; // Rythme normal (60 - 100 bpm)
-const int ledRed    = 8; // Rythme élevé (> 100 bpm)
 
-// Capteur PPG & Bouton d'action
-const int ppgPin    = A0;
+const int ledYellow = 6;
+const int ledGreen  = 7;
+const int ledRed    = 8;
+
 const int buttonPin = 9;
+const int ppgPin = A0;
 
-// ======================== OBJETS ET DRIVERS ========================
-// Écran 1 : Heure & BPM (Page buffer pour économiser la SRAM de l'ATmega328P)
-U8G2_SSD1306_128X64_NONAME_1_SW_I2C u8g2_1(U8G2_R0, OLED1_SCL, OLED1_SDA, U8X8_PIN_NONE);
+// ============================================================
+// OLED
+// ============================================================
 
-// Écran 2 : Graphique PPG
-U8G2_SSD1306_128X64_NONAME_1_SW_I2C u8g2_2(U8G2_R0, OLED2_SCL, OLED2_SDA, U8X8_PIN_NONE);
+U8G2_SSD1306_128X64_NONAME_1_SW_I2C u8g2_1(
+    U8G2_R0,
+    OLED1_SCL,
+    OLED1_SDA,
+    U8X8_PIN_NONE
+);
+
+U8G2_SSD1306_128X64_NONAME_1_SW_I2C u8g2_2(
+    U8G2_R0,
+    OLED2_SCL,
+    OLED2_SDA,
+    U8X8_PIN_NONE
+);
+
+// ============================================================
+// RTC
+// ============================================================
 
 ThreeWire myWire(rtcDAT, rtcCLK, rtcRST);
 RtcDS1302<ThreeWire> Rtc(myWire);
 
-// ======================== TRAITEMENT SIGNAL PPG (FS1) ========================
-#define WINDOW_SIZE 16
-int rawHistory[WINDOW_SIZE];
-byte histIdx = 0;
-long runningSum = 0;
+// ============================================================
+// MODES
+// ============================================================
 
-float maxAmp = 8.0;
-float filteredSignal = 0.0;
-bool signalInitialized = false;
-bool pulseDetected = false;
+enum SystemMode {
+    MODE_NORMAL,
+    MODE_MENU
+};
+
+SystemMode systemMode = MODE_NORMAL;
+
+// ============================================================
+// ENCODEUR
+// ============================================================
+
+int timeBaseIndex = 0;
+
+const int timeBases[3] = {
+    10,
+    20,
+    40
+};
+
+int menuRecordIndex = 0;
+
+// Détection simple de l'encodeur
+bool lastEncA = HIGH;
+
+// ============================================================
+// BPM
+// ============================================================
+
+const int BPM_MIN = 40;
+const int BPM_MAX = 200;
+
+float displayedBPM = 0;
+
 unsigned long lastBeatTime = 0;
-unsigned long beatInterval = 0;
-unsigned long candidateInterval = 0;
-byte consistentIntervals = 0;
-int bpm = 0;
-bool fingerPresent = false;
-int displayBpm = 0;
-int sensorRaw = 512;
-float centeredSignal = 0.0;
+unsigned long lastSignalTime = 0;
 
-// Buffer circulaire d'affichage pour l'écran 2
+bool beatDetected = false;
+
+int signalAverage = 512;
+int signalAmplitude = 0;
+
+const int FILTER_SIZE = 16;
+int filterBuffer[FILTER_SIZE];
+int filterIndex = 0;
+
+long filterSum = 0;
+
+int threshold = 0;
+
+const unsigned long MIN_BEAT_INTERVAL = 300;
+const unsigned long MAX_BEAT_INTERVAL = 2000;
+
+const unsigned long SIGNAL_TIMEOUT = 2500;
+
+// ============================================================
+// EEPROM
+// ============================================================
+
+#define EEPROM_MAGIC 0x42
+
+struct Measurement {
+    byte hour;
+    byte minute;
+    byte day;
+    byte month;
+    byte bpm;
+};
+
+const int EEPROM_START = 10;
+const int MAX_RECORDS = 20;
+
+int recordCount = 0;
+
+// ============================================================
+// MOYENNE DES 10 MESURES
+// ============================================================
+
+int bpmMeasurements[10];
+int bpmMeasurementCount = 0;
+
+// ============================================================
+// GRAPHIQUE PPG
+// ============================================================
+
 #define GRAPH_WIDTH 96
-uint8_t graphBuffer[GRAPH_WIDTH];
-byte graphHead = 0;
-int timeBaseIndex = 1; // 0: 10ms, 1: 20ms, 2: 40ms par pixel
-const int timeBases[] = {10, 20, 40};
 
-// ======================== ÉTATS ET CONTRÔLE ========================
+int graphValues[GRAPH_WIDTH];
+
+int graphIndex = 0;
+
+unsigned long lastGraphSample = 0;
+
+// ============================================================
+// BUZZER
+// ============================================================
+
 bool buzzerMuted = false;
-unsigned long beepEndTime = 0;
-int beepFreq = 0;
+unsigned long lastBuzzerTime = 0;
 
-struct ButtonState {
-  bool lastReading = HIGH;
-  bool stableState = HIGH;
-  unsigned long lastChangeTime = 0;
-  unsigned long pressedAt = 0;
-};
+// ============================================================
+// BOUTONS
+// ============================================================
 
-ButtonState actionButtonState;
-ButtonState encoderButtonState;
+bool lastButtonState = HIGH;
+bool lastEncoderButtonState = HIGH;
 
-// Sauvegarde EEPROM (FS6)
-struct Record {
-  uint8_t hour;
-  uint8_t min;
-  uint8_t day;
-  uint8_t month;
-  uint8_t bpm;
-};
-int eepromAddress = 0;
+unsigned long buttonPressStart = 0;
+unsigned long encoderButtonPressStart = 0;
 
-void saveBpmRecord(unsigned long now) {
-  if (displayBpm == 0) return;
+// ============================================================
+// FONCTIONS EEPROM
+// ============================================================
 
-  RtcDateTime dt = Rtc.GetDateTime();
-  Record r = {(uint8_t)dt.Hour(), (uint8_t)dt.Minute(), (uint8_t)dt.Day(), (uint8_t)dt.Month(), (uint8_t)displayBpm};
-  EEPROM.put(eepromAddress, r);
-  eepromAddress = (eepromAddress + sizeof(Record)) % 256;
+void loadEEPROM() {
+
+    if (EEPROM.read(0) != EEPROM_MAGIC) {
+        recordCount = 0;
+        return;
+    }
+
+    recordCount = EEPROM.read(1);
+
+    if (recordCount < 0 || recordCount > MAX_RECORDS) {
+        recordCount = 0;
+    }
 }
 
-void updateActionButton(int pin, ButtonState& state, unsigned long now) {
-  bool reading = digitalRead(pin);
-  if (reading != state.lastReading) {
-    state.lastReading = reading;
-    state.lastChangeTime = now;
-  }
+void saveRecord(const Measurement &m) {
 
-  if (reading == state.stableState || now - state.lastChangeTime < 30) return;
-  state.stableState = reading;
+    if (recordCount >= MAX_RECORDS) {
+        recordCount = 0;
+    }
 
-  if (state.stableState == LOW) {
-    state.pressedAt = now;
-    return;
-  }
+    int address = EEPROM_START + recordCount * sizeof(Measurement);
 
-  unsigned long duration = now - state.pressedAt;
-  if (duration >= 50 && duration < 800) {
-    buzzerMuted = !buzzerMuted;
-    if (buzzerMuted) noTone(buzzerPin);
-  } else if (duration >= 800) {
-    saveBpmRecord(now);
-  }
+    EEPROM.put(address, m);
+
+    recordCount++;
+
+    EEPROM.update(0, EEPROM_MAGIC);
+    EEPROM.update(1, recordCount);
 }
 
-// Traitement du signal PPG (Moyenne glissante + recentrage + seuillage adaptatif)
-void processPPG(int raw, unsigned long now) {
-  sensorRaw = raw;
-  if (!signalInitialized) {
-    for (byte i = 0; i < WINDOW_SIZE; i++) rawHistory[i] = raw;
-    runningSum = (long)raw * WINDOW_SIZE;
-    signalInitialized = true;
-  }
+Measurement readRecord(int index) {
 
-  runningSum -= rawHistory[histIdx];
-  rawHistory[histIdx] = raw;
-  runningSum += raw;
-  histIdx = (histIdx + 1) % WINDOW_SIZE;
+    Measurement m;
 
-  float baseline = (float)runningSum / WINDOW_SIZE;
-  float acSignal = raw - baseline;
-  filteredSignal += (acSignal - filteredSignal) * 0.25;
-  centeredSignal = filteredSignal;
+    if (index < 0 || index >= recordCount) {
+        m.hour = 0;
+        m.minute = 0;
+        m.day = 0;
+        m.month = 0;
+        m.bpm = 0;
+        return m;
+    }
 
-  // Ne rejeter que les valeurs proches des rails ADC. Certains capteurs PPG
-  // font chuter la sortie analogique quand le doigt couvre le photodétecteur.
-  if (raw <= 2 || raw >= 1021) {
-    fingerPresent = false;
-    bpm = 0;
-    displayBpm = 0;
-    pulseDetected = false;
-    lastBeatTime = 0;
-    candidateInterval = 0;
-    consistentIntervals = 0;
-    graphBuffer[graphHead] = 22;
-    graphHead = (graphHead + 1) % GRAPH_WIDTH;
-    return;
-  }
-  fingerPresent = true;
+    int address = EEPROM_START + index * sizeof(Measurement);
 
-  float signalMagnitude = fabs(centeredSignal);
-  float envelopeRate = (signalMagnitude > maxAmp) ? 0.15 : 0.02;
-  maxAmp += (signalMagnitude - maxAmp) * envelopeRate;
-  if (maxAmp < 1.5) maxAmp = 1.5;
+    EEPROM.get(address, m);
 
-  // Normalisation du signal centré autour de la ligne médiane du graphique.
-  float normalized = 0.5 + centeredSignal / (2.0 * maxAmp);
-  normalized = constrain(normalized, 0.0, 1.0);
+    return m;
+}
 
-  // Écriture dans le buffer graphique pour l'écran 2
-  graphBuffer[graphHead] = (uint8_t)(normalized * 45); // amplitude 0-45 px
-  graphHead = (graphHead + 1) % GRAPH_WIDTH;
+void clearEEPROM() {
 
-  // Seuillage et détection de battement (ET1.1)
-  float threshold = max(2.0, maxAmp * 0.65);
-  if (signalMagnitude > threshold && !pulseDetected) {
-    if (lastBeatTime == 0) {
-      pulseDetected = true;
-      lastBeatTime = now;
-    } else if (now - lastBeatTime >= 300) { // Période réfractaire (max 200 bpm)
-      beatInterval = now - lastBeatTime;
-      lastBeatTime = now;
-      pulseDetected = true;
+    EEPROM.update(0, 0);
+    EEPROM.update(1, 0);
 
-      if (beatInterval <= 2000) {
-        bpm = 60000 / beatInterval;
-        if (bpm >= 40 && bpm <= 200) {
-          if (candidateInterval == 0) {
-            candidateInterval = beatInterval;
-            consistentIntervals = 0;
-          } else {
-            unsigned long difference = (beatInterval > candidateInterval)
-              ? beatInterval - candidateInterval
-              : candidateInterval - beatInterval;
-            if (difference <= candidateInterval / 4) {
-              candidateInterval = (candidateInterval * 3 + beatInterval) / 4;
-              if (consistentIntervals < 2) consistentIntervals++;
-              if (consistentIntervals >= 1) {
-                displayBpm = (displayBpm == 0) ? bpm : ((displayBpm * 3 + bpm) / 4); // Lissage
+    recordCount = 0;
+    menuRecordIndex = 0;
+}
 
-                // Configuration du bip sonore en fonction du rythme (FS4)
-                if (!buzzerMuted) {
-                  if (displayBpm < 60)      beepFreq = 600;  // Grave
-                  else if (displayBpm <= 100) beepFreq = 1000; // Modéré
-                  else                      beepFreq = 1800; // Aigu
-                  tone(buzzerPin, beepFreq);
-                  beepEndTime = now + 40; // bip court de 40 ms
-                }
-              }
-            } else {
-              candidateInterval = beatInterval;
-              consistentIntervals = 0;
-              displayBpm = 0;
-            }
-          }
-        } else {
-          candidateInterval = 0;
-          consistentIntervals = 0;
-          displayBpm = 0;
+// ============================================================
+// SAUVEGARDE MOYENNE DE 10 MESURES
+// ============================================================
+
+void addBPMMeasurement(int bpm) {
+
+    if (bpm < BPM_MIN || bpm > BPM_MAX) {
+        return;
+    }
+
+    if (bpmMeasurementCount < 10) {
+
+        bpmMeasurements[bpmMeasurementCount] = bpm;
+        bpmMeasurementCount++;
+    }
+
+    if (bpmMeasurementCount >= 10) {
+
+        long total = 0;
+
+        for (int i = 0; i < 10; i++) {
+            total += bpmMeasurements[i];
         }
-      } else {
-        candidateInterval = 0;
-        consistentIntervals = 0;
-        displayBpm = 0;
-      }
+
+        int average = total / 10;
+
+        RtcDateTime now = Rtc.GetDateTime();
+
+        Measurement m;
+
+        m.hour = now.Hour();
+        m.minute = now.Minute();
+        m.day = now.Day();
+        m.month = now.Month();
+        m.bpm = average;
+
+        saveRecord(m);
+
+        bpmMeasurementCount = 0;
     }
-  }
-
-  if (signalMagnitude < threshold * 0.4 && pulseDetected) {
-    pulseDetected = false;
-  }
-
-  if (lastBeatTime != 0 && now - lastBeatTime > 2500) {
-    lastBeatTime = 0;
-    candidateInterval = 0;
-    consistentIntervals = 0;
-    pulseDetected = false;
-    bpm = 0;
-    displayBpm = 0;
-  }
 }
 
-// Mise à jour de l'affichage Écran 1 (Heure & BPM)
-void drawScreen1(const RtcDateTime& dt) {
-  u8g2_1.firstPage();
-  do {
-    u8g2_1.setFont(u8g2_font_profont15_tr);
-    char dateStr[16];
-    snprintf(dateStr, sizeof(dateStr), "%02d/%02d %02d:%02d:%02d", dt.Day(), dt.Month(), dt.Hour(), dt.Minute(), dt.Second());
-    u8g2_1.drawStr(5, 12, dateStr);
-    u8g2_1.drawHLine(0, 16, 128);
+// ============================================================
+// LEDS
+// ============================================================
 
-    if (fingerPresent && displayBpm > 0) {
-      u8g2_1.setFont(u8g2_font_logisoso32_tr);
-      char bpmStr[8];
-      snprintf(bpmStr, sizeof(bpmStr), "%d", displayBpm);
-      u8g2_1.drawStr(10, 56, bpmStr);
+void updateLEDs(int bpm) {
 
-      u8g2_1.setFont(u8g2_font_helvB12_tr);
-      u8g2_1.drawStr(80, 52, "BPM");
-    } else {
-      u8g2_1.setFont(u8g2_font_logisoso32_tr);
-      u8g2_1.drawStr(35, 56, "--");
+    digitalWrite(ledYellow, LOW);
+    digitalWrite(ledGreen, LOW);
+    digitalWrite(ledRed, LOW);
+
+    if (bpm < BPM_MIN || bpm > BPM_MAX) {
+        return;
     }
+
+    if (bpm < 60) {
+        digitalWrite(ledYellow, HIGH);
+    }
+    else if (bpm <= 100) {
+        digitalWrite(ledGreen, HIGH);
+    }
+    else {
+        digitalWrite(ledRed, HIGH);
+    }
+}
+
+// ============================================================
+// BUZZER
+// ============================================================
+
+void beepForBPM(int bpm) {
 
     if (buzzerMuted) {
-      u8g2_1.setFont(u8g2_font_profont10_tr);
-      u8g2_1.drawStr(100, 63, "MUTE");
-    } else {
-      u8g2_1.setFont(u8g2_font_profont10_tr);
-      u8g2_1.drawStr(100, 63, "BIP");
+        return;
     }
-  } while (u8g2_1.nextPage());
+
+    if (bpm < BPM_MIN || bpm > BPM_MAX) {
+        return;
+    }
+
+    int frequency;
+
+    if (bpm < 60) {
+        frequency = 600;
+    }
+    else if (bpm <= 100) {
+        frequency = 1000;
+    }
+    else {
+        frequency = 1800;
+    }
+
+    tone(buzzerPin, frequency, 60);
 }
 
-// Mise à jour de l'affichage Écran 2 (Graphique PPG gradué)
+// ============================================================
+// FILTRAGE PPG
+// ============================================================
+
+int readFilteredPPG() {
+
+    int value = analogRead(ppgPin);
+
+    filterSum -= filterBuffer[filterIndex];
+
+    filterBuffer[filterIndex] = value;
+
+    filterSum += value;
+
+    filterIndex++;
+
+    if (filterIndex >= FILTER_SIZE) {
+        filterIndex = 0;
+    }
+
+    return filterSum / FILTER_SIZE;
+}
+
+// ============================================================
+// DETECTION DU BATTEMENT
+// ============================================================
+
+void processPPG() {
+
+    int signal = readFilteredPPG();
+
+    signalAverage = (signalAverage * 15 + signal) / 16;
+
+    int centeredSignal = signal - signalAverage;
+
+    int absoluteSignal = abs(centeredSignal);
+
+    signalAmplitude = (signalAmplitude * 15 + absoluteSignal) / 16;
+
+    threshold = (signalAmplitude * 65) / 100;
+
+    unsigned long now = millis();
+
+    // --------------------------------------------------------
+    // Détection avec seuil
+    // --------------------------------------------------------
+
+    if (!beatDetected) {
+
+        if (centeredSignal > threshold) {
+
+            unsigned long interval = now - lastBeatTime;
+
+            if (interval >= MIN_BEAT_INTERVAL &&
+                interval <= MAX_BEAT_INTERVAL) {
+
+                int bpm = 60000 / interval;
+
+                if (bpm >= BPM_MIN && bpm <= BPM_MAX) {
+
+                    displayedBPM =
+                        (displayedBPM * 2.0 + bpm) / 3.0;
+
+                    addBPMMeasurement(bpm);
+
+                    updateLEDs((int)displayedBPM);
+
+                    beepForBPM((int)displayedBPM);
+
+                    lastBeatTime = now;
+                    lastSignalTime = now;
+
+                    beatDetected = true;
+                }
+            }
+            else if (lastBeatTime == 0) {
+
+                lastBeatTime = now;
+            }
+        }
+    }
+    else {
+
+        // Hystérésis
+        if (centeredSignal < threshold * 0.40) {
+            beatDetected = false;
+        }
+    }
+
+    // --------------------------------------------------------
+    // Timeout
+    // --------------------------------------------------------
+
+    if (lastBeatTime != 0 &&
+        now - lastBeatTime > SIGNAL_TIMEOUT) {
+
+        displayedBPM = 0;
+
+        digitalWrite(ledYellow, LOW);
+        digitalWrite(ledGreen, LOW);
+        digitalWrite(ledRed, LOW);
+    }
+
+    // --------------------------------------------------------
+    // Graphique
+    // --------------------------------------------------------
+
+    unsigned long graphPeriod =
+        (unsigned long)timeBases[timeBaseIndex];
+
+    if (now - lastGraphSample >= graphPeriod) {
+
+        lastGraphSample = now;
+
+        graphValues[graphIndex] = signal;
+
+        graphIndex++;
+
+        if (graphIndex >= GRAPH_WIDTH) {
+            graphIndex = 0;
+        }
+    }
+}
+
+// ============================================================
+// ECRAN 1
+// ============================================================
+
+void drawScreen1() {
+
+    u8g2_1.firstPage();
+
+    do {
+
+        u8g2_1.setFont(u8g2_font_6x10_tr);
+
+        if (systemMode == MODE_NORMAL) {
+
+            RtcDateTime now = Rtc.GetDateTime();
+
+            char timeText[10];
+
+            snprintf(
+                timeText,
+                sizeof(timeText),
+                "%02d:%02d:%02d",
+                now.Hour(),
+                now.Minute(),
+                now.Second()
+            );
+
+            u8g2_1.drawStr(0, 10, timeText);
+
+            u8g2_1.drawStr(0, 27, "BPM:");
+
+            if (displayedBPM > 0) {
+
+                char bpmText[10];
+
+                snprintf(
+                    bpmText,
+                    sizeof(bpmText),
+                    "%d",
+                    (int)displayedBPM
+                );
+
+                u8g2_1.drawStr(35, 27, bpmText);
+            }
+            else {
+
+                u8g2_1.drawStr(35, 27, "--");
+            }
+
+            u8g2_1.drawStr(0, 45, "PPG Cardio");
+
+            u8g2_1.drawStr(
+                0,
+                60,
+                buzzerMuted ? "Buzzer OFF" : "Buzzer ON"
+            );
+        }
+
+        else {
+
+            u8g2_1.drawStr(0, 10, "MENU EEPROM");
+
+            if (recordCount == 0) {
+
+                u8g2_1.drawStr(0, 30, "Aucune mesure");
+            }
+            else {
+
+                Measurement m =
+                    readRecord(menuRecordIndex);
+
+                char line[25];
+
+                snprintf(
+                    line,
+                    sizeof(line),
+                    "%d/%d",
+                    menuRecordIndex + 1,
+                    recordCount
+                );
+
+                u8g2_1.drawStr(0, 25, line);
+
+                snprintf(
+                    line,
+                    sizeof(line),
+                    "%02d:%02d  %d BPM",
+                    m.hour,
+                    m.minute,
+                    m.bpm
+                );
+
+                u8g2_1.drawStr(0, 42, line);
+
+                snprintf(
+                    line,
+                    sizeof(line),
+                    "%02d/%02d",
+                    m.day,
+                    m.month
+                );
+
+                u8g2_1.drawStr(0, 58, line);
+            }
+        }
+
+    } while (u8g2_1.nextPage());
+}
+
+// ============================================================
+// ECRAN 2
+// ============================================================
+
 void drawScreen2() {
-  u8g2_2.firstPage();
-  do {
-    u8g2_2.setFont(u8g2_font_6x10_tr);
-    // La valeur brute permet de vérifier immédiatement que le capteur réagit.
-    char statusStr[22];
-    snprintf(statusStr, sizeof(statusStr), "A0:%d %dms/px", sensorRaw, timeBases[timeBaseIndex]);
-    u8g2_2.drawStr(2, 10, statusStr);
 
-    // Axe gradué
-    u8g2_2.drawVLine(18, 14, 48);
-    u8g2_2.drawHLine(18, 62, 108);
-    u8g2_2.drawStr(2, 22, "1.0");
-    u8g2_2.drawStr(2, 62, "0.0");
+    u8g2_2.firstPage();
 
-    // Tracé de la courbe
-    for (int i = 0; i < GRAPH_WIDTH - 1; i++) {
-      int idx1 = (graphHead + i) % GRAPH_WIDTH;
-      int idx2 = (graphHead + i + 1) % GRAPH_WIDTH;
-      int y1 = 62 - graphBuffer[idx1];
-      int y2 = 62 - graphBuffer[idx2];
-      u8g2_2.drawLine(20 + i, y1, 21 + i, y2);
+    do {
+
+        u8g2_2.setFont(u8g2_font_6x10_tr);
+
+        char info[25];
+
+        snprintf(
+            info,
+            sizeof(info),
+            "A0:%d %dms/px",
+            signalAverage,
+            timeBases[timeBaseIndex]
+        );
+
+        u8g2_2.drawStr(0, 9, info);
+
+        // Axe horizontal
+        u8g2_2.drawLine(
+            15,
+            60,
+            127,
+            60
+        );
+
+        // Axe vertical
+        u8g2_2.drawLine(
+            15,
+            15,
+            15,
+            60
+        );
+
+        // Graphique
+        for (int x = 0; x < GRAPH_WIDTH - 1; x++) {
+
+            int i1 =
+                (graphIndex + x) % GRAPH_WIDTH;
+
+            int i2 =
+                (graphIndex + x + 1) % GRAPH_WIDTH;
+
+            int y1 =
+                map(
+                    graphValues[i1],
+                    0,
+                    1023,
+                    58,
+                    18
+                );
+
+            int y2 =
+                map(
+                    graphValues[i2],
+                    0,
+                    1023,
+                    58,
+                    18
+                );
+
+            u8g2_2.drawLine(
+                16 + x,
+                y1,
+                17 + x,
+                y2
+            );
+        }
+
+    } while (u8g2_2.nextPage());
+}
+
+// ============================================================
+// ENCODEUR ROTATIF
+// ============================================================
+
+void processEncoder() {
+
+    bool encA = digitalRead(pinEncA);
+    bool encB = digitalRead(pinEncB);
+
+    // On détecte le front descendant de A
+    if (lastEncA == HIGH && encA == LOW) {
+
+        if (encB == HIGH) {
+
+            // Sens 1
+            if (systemMode == MODE_NORMAL) {
+
+                timeBaseIndex++;
+
+                if (timeBaseIndex >= 3) {
+                    timeBaseIndex = 0;
+                }
+            }
+            else {
+
+                if (recordCount > 0) {
+
+                    menuRecordIndex++;
+
+                    if (menuRecordIndex >= recordCount) {
+                        menuRecordIndex = 0;
+                    }
+                }
+            }
+        }
+
+        else {
+
+            // Sens 2
+            if (systemMode == MODE_NORMAL) {
+
+                if (timeBaseIndex == 0) {
+                    timeBaseIndex = 2;
+                }
+                else {
+                    timeBaseIndex--;
+                }
+            }
+            else {
+
+                if (recordCount > 0) {
+
+                    if (menuRecordIndex == 0) {
+                        menuRecordIndex = recordCount - 1;
+                    }
+                    else {
+                        menuRecordIndex--;
+                    }
+                }
+            }
+        }
     }
-  } while (u8g2_2.nextPage());
+
+    lastEncA = encA;
 }
 
-// Gestion des voyants LED (FS3)
-void updateLEDs() {
-  if (!fingerPresent || displayBpm == 0) {
-    digitalWrite(ledYellow, LOW);
-    digitalWrite(ledGreen, LOW);
-    digitalWrite(ledRed, LOW);
-    return;
-  }
+// ============================================================
+// BOUTON D9
+// ============================================================
 
-  // ET3.1 : un seul voyant allumé à la fois
-  if (displayBpm < 60) {
-    digitalWrite(ledYellow, HIGH);
-    digitalWrite(ledGreen, LOW);
-    digitalWrite(ledRed, LOW);
-  } else if (displayBpm <= 100) {
-    digitalWrite(ledYellow, LOW);
-    digitalWrite(ledGreen, HIGH);
-    digitalWrite(ledRed, LOW);
-  } else {
-    digitalWrite(ledYellow, LOW);
-    digitalWrite(ledGreen, LOW);
-    digitalWrite(ledRed, HIGH);
-  }
+void processMainButton() {
+
+    bool state = digitalRead(buttonPin);
+
+    if (lastButtonState == HIGH && state == LOW) {
+
+        buttonPressStart = millis();
+    }
+
+    if (lastButtonState == LOW && state == HIGH) {
+
+        unsigned long duration =
+            millis() - buttonPressStart;
+
+        // Appui court : mute buzzer
+        if (duration < 1000) {
+
+            buzzerMuted = !buzzerMuted;
+
+            if (buzzerMuted) {
+                noTone(buzzerPin);
+            }
+        }
+    }
+
+    lastButtonState = state;
 }
 
-// ======================== SETUP ========================
+// ============================================================
+// BOUTON ENCODEUR D11
+// ============================================================
+
+void processEncoderButton() {
+
+    bool state = digitalRead(pinEncSW);
+
+    if (lastEncoderButtonState == HIGH &&
+        state == LOW) {
+
+        encoderButtonPressStart = millis();
+    }
+
+    if (lastEncoderButtonState == LOW &&
+        state == HIGH) {
+
+        unsigned long duration =
+            millis() - encoderButtonPressStart;
+
+        // Appui long : effacement EEPROM
+        if (duration >= 1500) {
+
+            clearEEPROM();
+        }
+
+        // Appui court : menu
+        else {
+
+            if (systemMode == MODE_NORMAL) {
+
+                systemMode = MODE_MENU;
+                menuRecordIndex = 0;
+            }
+            else {
+
+                systemMode = MODE_NORMAL;
+            }
+        }
+    }
+
+    lastEncoderButtonState = state;
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
 void setup() {
-  Serial.begin(115200);
 
-  // Configuration I/O
-  pinMode(buzzerPin, OUTPUT);
-  pinMode(ledYellow, OUTPUT);
-  pinMode(ledGreen, OUTPUT);
-  pinMode(ledRed, OUTPUT);
+    // --------------------------------------------------------
+    // Pins
+    // --------------------------------------------------------
 
-  pinMode(buttonPin, INPUT_PULLUP);
-  pinMode(pinEncA, INPUT_PULLUP);
-  pinMode(pinEncB, INPUT_PULLUP);
-  pinMode(pinEncSW, INPUT_PULLUP);
+    pinMode(pinEncA, INPUT_PULLUP);
+    pinMode(pinEncB, INPUT_PULLUP);
+    pinMode(pinEncSW, INPUT_PULLUP);
 
-  // Initialisation RTC
-  Rtc.Begin();
-  if (!Rtc.IsDateTimeValid()) {
-    Rtc.SetDateTime(RtcDateTime(__DATE__, __TIME__)); // Régle l'heure de compilation par défaut
-  }
+    pinMode(buttonPin, INPUT_PULLUP);
 
-  // Initialisation écrans
-  u8g2_1.begin();
-  u8g2_2.begin();
+    pinMode(buzzerPin, OUTPUT);
 
-  for (int i = 0; i < WINDOW_SIZE; i++) rawHistory[i] = 512;
-  runningSum = 512L * WINDOW_SIZE;
+    pinMode(ledYellow, OUTPUT);
+    pinMode(ledGreen, OUTPUT);
+    pinMode(ledRed, OUTPUT);
 
-  // Test bref des sorties au démarrage, indépendant de la détection du pouls.
-  const int leds[] = {ledYellow, ledGreen, ledRed};
-  for (byte i = 0; i < 3; i++) {
-    digitalWrite(leds[i], HIGH);
-    delay(80);
-    digitalWrite(leds[i], LOW);
-  }
-  tone(buzzerPin, 1000, 100);
-  delay(120);
-  noTone(buzzerPin);
+    digitalWrite(ledYellow, LOW);
+    digitalWrite(ledGreen, LOW);
+    digitalWrite(ledRed, LOW);
+
+    // --------------------------------------------------------
+    // Initialisation OLED
+    // --------------------------------------------------------
+
+    u8g2_1.begin();
+    u8g2_2.begin();
+
+    // --------------------------------------------------------
+    // Initialisation RTC
+    // --------------------------------------------------------
+
+    Rtc.Begin();
+
+    // --------------------------------------------------------
+    // Initialisation filtre
+    // --------------------------------------------------------
+
+    int initialValue = analogRead(ppgPin);
+
+    for (int i = 0; i < FILTER_SIZE; i++) {
+
+        filterBuffer[i] = initialValue;
+        filterSum += initialValue;
+    }
+
+    signalAverage = initialValue;
+
+    // --------------------------------------------------------
+    // Graphique
+    // --------------------------------------------------------
+
+    for (int i = 0; i < GRAPH_WIDTH; i++) {
+        graphValues[i] = initialValue;
+    }
+
+    // --------------------------------------------------------
+    // EEPROM
+    // --------------------------------------------------------
+
+    loadEEPROM();
+
+    // --------------------------------------------------------
+    // Encodeur
+    // --------------------------------------------------------
+
+    lastEncA = digitalRead(pinEncA);
 }
 
-// ======================== LOOP ========================
+// ============================================================
+// LOOP
+// ============================================================
+
 void loop() {
-  unsigned long now = millis();
 
-  // 1. Échantillonnage PPG cadencé selon la base de temps choisie
-  static unsigned long lastSample = 0;
-  if (now - lastSample >= (unsigned long)timeBases[timeBaseIndex]) {
-    lastSample = now;
-    int raw = analogRead(ppgPin);
-    processPPG(raw, now);
+    // Lecture PPG
+    processPPG();
 
-    // Télémétrie Teleplot
-    Serial.print(F(">raw:"));
-    Serial.println(sensorRaw);
-    Serial.print(F(">centered:"));
-    Serial.println(centeredSignal, 1);
-    Serial.print(F(">bpm:"));
-    Serial.println(displayBpm);
-  }
+    // Encodeur
+    processEncoder();
 
-  // 2. Gestion non-bloquante de l'arrêt du son (FS4)
-  if (beepEndTime > 0 && now >= beepEndTime) {
-    noTone(buzzerPin);
-    beepEndTime = 0;
-  }
+    // Bouton D9
+    processMainButton();
 
-  // Bouton D9 et bouton intégré à l'encodeur D11 : clic court mute, long enregistre.
-  updateActionButton(buttonPin, actionButtonState, now);
-  updateActionButton(pinEncSW, encoderButtonState, now);
+    // Bouton de l'encodeur D11
+    processEncoderButton();
 
-  // 4. Gestion de l'encodeur rotatif (changement de base de temps)
-  static byte lastEncoderState = 0;
-  static int encoderSteps = 0;
-  byte encoderState = (digitalRead(pinEncA) << 1) | digitalRead(pinEncB);
-  static const int8_t encoderTransitions[16] = {
-     0, -1,  1,  0,
-     1,  0,  0, -1,
-    -1,  0,  0,  1,
-     0,  1, -1,  0
-  };
-  encoderSteps += encoderTransitions[(lastEncoderState << 2) | encoderState];
-  // Certains encodeurs ont deux transitions par cran, d'autres quatre.
-  if (encoderSteps >= 2) {
-    timeBaseIndex = (timeBaseIndex + 1) % 3;
-    encoderSteps = 0;
-  } else if (encoderSteps <= -2) {
-    timeBaseIndex = (timeBaseIndex + 2) % 3;
-    encoderSteps = 0;
-  }
-  lastEncoderState = encoderState;
-
-  // Diagnostic lent des entrées pour distinguer une panne de lecture d'un souci
-  // de traitement du signal, sans saturer le moniteur série.
-  static unsigned long lastInputReport = 0;
-  if (now - lastInputReport >= 250) {
-    lastInputReport = now;
-    Serial.print(F(">encA:"));
-    Serial.println(digitalRead(pinEncA));
-    Serial.print(F(">encB:"));
-    Serial.println(digitalRead(pinEncB));
-    Serial.print(F(">btn9:"));
-    Serial.println(digitalRead(buttonPin));
-    Serial.print(F(">btn11:"));
-    Serial.println(digitalRead(pinEncSW));
-  }
-
-  // 5. Rafraîchissement des affichages et LEDs (toutes les 100 ms)
-  static unsigned long lastDisplay = 0;
-  if (now - lastDisplay >= 100) {
-    lastDisplay = now;
-    RtcDateTime dt = Rtc.GetDateTime();
-    drawScreen1(dt);
+    // Affichage
+    drawScreen1();
     drawScreen2();
-    updateLEDs();
-  }
+
+    delay(2);
 }
