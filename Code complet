@@ -5,37 +5,38 @@
 #include <RtcDS1302.h>
 
 // =============================================================================
-// 1. CONFIGURATION MATÉRIELLE
+// 1. CONFIGURATION MATÉRIELLE DES BROCHES
 // =============================================================================
+// FS1 : Capteur analogique PPG
 const byte PIN_PPG = A0;
 
-// RTC DS1302 (D2, D3, D4)
+// FS2 : Horloge RTC DS1302 (D2=RST/CE, D3=DAT/IO, D4=CLK/SCLK)
 const int RST_PIN = 2;
 const int DAT_PIN = 3;
 const int CLK_PIN = 4;
 ThreeWire monFil(DAT_PIN, CLK_PIN, RST_PIN);
 RtcDS1302<ThreeWire> Rtc(monFil);
 
-// LED RGB
-const byte PIN_LED_BLEU  = 6;
-const byte PIN_LED_VERT  = 7;
-const byte PIN_LED_ROUGE = 8;
+// FS3 : LED RGB (Cathode commune reliée à la masse GND)
+const byte PIN_LED_BLEU  = 6; // D6
+const byte PIN_LED_VERT  = 7; // D7
+const byte PIN_LED_ROUGE = 8; // D8
 
-// Buzzer & Bouton Mute
-const byte PIN_BUZZER      = 5;
-const byte PIN_BOUTON_MUTE = 9;
+// FS4 : Buzzer piézoélectrique et bouton poussoir Mute/Unmute
+const byte PIN_BUZZER      = 5; // D5
+const byte PIN_BOUTON_MUTE = 9; // D9 (câblé vers GND avec PULLUP)
 
-// Encodeur EC11
-const byte PIN_ENC_A  = 10;
-const byte PIN_ENC_B  = 12;
-const byte PIN_ENC_SW = 11;
+// FS5 & FS6 : Encodeur rotatif EC11
+const byte PIN_ENC_A  = 10; // D10 (PB2 / PCINT2)
+const byte PIN_ENC_B  = 12; // D12 (PB4 / PCINT4)
+const byte PIN_ENC_SW = 11; // D11 (Axe poussoir vers GND)
 
-// Écrans OLED (Software I2C)
+// FS5 : Double afficheur OLED SSD1306 (Software I2C)
 U8G2_SSD1306_128X64_NONAME_1_SW_I2C ecran1(U8G2_R0, /* clock=*/ A4, /* data=*/ A3, /* reset=*/ U8X8_PIN_NONE);
 U8G2_SSD1306_128X64_NONAME_1_SW_I2C ecran2(U8G2_R0, /* clock=*/ A2, /* data=*/ A1, /* reset=*/ U8X8_PIN_NONE);
 
 // =============================================================================
-// 2. STRUCTURE EEPROM (FS6)
+// 2. STRUCTURE ET GESTION EEPROM (FS6)
 // =============================================================================
 #define ADRESSE_MAGIC       0    
 #define ADRESSE_NB_MESURES  2    
@@ -48,7 +49,7 @@ struct MesureEEPROM {
   uint8_t bpm;
   uint8_t jour;
   uint8_t mois;
-  uint8_t annee;
+  uint8_t annee; // offset année 2000
   uint8_t heure;
   uint8_t minute;
   uint8_t seconde;
@@ -62,13 +63,15 @@ ModeEcran modeActuel = MODE_NORMAL;
 
 int indexHistorique = 0;
 uint8_t nbMesuresStockees = 0;
-byte optionSelectionnee = 0;
+byte optionSelectionnee = 0; // 0 = Langue, 1 = Effacer
 
+// Variables pour le calcul de moyenne sur 10 points (ET6.2)
 bool acquisitionEnCours = false;
 uint8_t compteurEchantillons = 0;
 uint16_t sommeBpm = 0;
 unsigned long dernierEchantillonMoyenne = 0;
 
+// Détection appui court / long sur l'axe encodeur (D11)
 const unsigned long SEUIL_APPUI_COURT_MS = 1500;
 const unsigned long SEUIL_APPUI_LONG_MS  = 5000;
 bool boutonEstEnfonce = false;
@@ -76,40 +79,41 @@ unsigned long tempsDebutEnfonce = 0;
 unsigned long dureeAppuiCourante = 0;
 
 // =============================================================================
-// 3. VARIABLES TRAITEMENT PPG (GÉRÉES EN INTERRUPTION TIMER1)
+// 3. VARIABLES DU TRAITEMENT PPG (TIMER1 & DOUBLE BUFFERING)
 // =============================================================================
 volatile int ppgBrut = 0;
 volatile float ppgLisse = 500.0f;
 volatile float ppgBase = 500.0f;
-volatile float ppgAC = 0.0f;
 volatile float ppgCrete = 30.0f;
-volatile uint8_t ppgNormHauteur = 0; // 0 à 34 pixels pour l'écran
 
 volatile bool doigtPresentVolatile = false;
 volatile int bpmCalculeVolatile = 0;
 volatile bool nouveauBattement = false;
 
-// Variables miroir pour la boucle loop
-int bpmAffiche = 0;
-bool doigtPresent = false;
-
-// Oscilloscope PPG (Écran 2)
+// Double buffer pour supprimer les collisions mémoire et l'effet de vermicelles
 const byte LARGEUR_TRACE = 88;
 const byte HAUTEUR_TRACE = 36;
 const byte Y_BASE = 54;
-uint8_t bufferPPG[LARGEUR_TRACE];
-byte indexTrace = 0;
+volatile uint8_t bufferPPG_Interne[LARGEUR_TRACE];
+volatile byte indexTraceInterne = 0;
 
+uint8_t bufferPPG_Affiche[LARGEUR_TRACE]; // Tampon figé pour le dessin
+
+// Décimation temporelle pour les 3 échelles de l'oscilloscope
 const uint8_t NB_ECHELLES = 3;
-const unsigned int ECHELLES_DIVISEUR[NB_ECHELLES] = {1, 2, 4}; // Décimation temporelle
-const char NOMS_ECHELLES[3][8] = {"10ms", "20ms", "40ms"};
+const unsigned int ECHELLES_DIVISEUR[NB_ECHELLES] = {1, 2, 4}; // 10ms, 20ms, 40ms
+const char NOMS_ECHELLES[3][8] = {"10ms", "25ms", "50ms"};
 volatile int8_t indexEchelle = 1;
+
+// Variables miroir pour la boucle loop
+int bpmAffiche = 0;
+bool doigtPresent = false;
 
 unsigned long dernierAffichagePPG = 0;
 unsigned long dernierAffichageHeure = 0;
 char strHeure[9] = "00:00:00";
 
-// Actionneurs
+// FS4 : Paramètres audio
 const unsigned int FREQ_GRAVE   = 440;
 const unsigned int FREQ_MODEREE = 880;
 const unsigned int FREQ_AIGUE   = 1760;
@@ -117,10 +121,14 @@ bool sonActive = true;
 bool dernierEtatMute = HIGH;
 unsigned long dernierDebounceMute = 0;
 
+// Encodeur
 volatile int deltaEncodeur = 0;
 volatile unsigned long dernierTempsInterruption = 0;
 
-// Interruption Encodeur
+// =============================================================================
+// 4. ROUTINES D'INTERRUPTION MATÉRIELLE
+// =============================================================================
+// Interruption PCINT sur l'encodeur rotatif (D10 / D12)
 ISR(PCINT0_vect) {
   uint8_t etatA = (PINB & (1 << PINB2)) ? HIGH : LOW;
   uint8_t etatB = (PINB & (1 << PINB4)) ? HIGH : LOW;
@@ -138,9 +146,7 @@ ISR(PCINT0_vect) {
   }
 }
 
-// =============================================================================
-// ROUTINE D'INTERRUPTION TIMER 1 : CADENCÉE STRICTEMENT À 100 Hz (10 ms)
-// =============================================================================
+// Routine d'interruption Timer 1 : Échantillonnage PPG cadencé rigoureusement à 100 Hz (10 ms)
 ISR(TIMER1_COMPA_vect) {
   static unsigned int compteurEchelle = 0;
   static unsigned long tempsDernierPic = 0;
@@ -151,11 +157,10 @@ ISR(TIMER1_COMPA_vect) {
   int brut = analogRead(PIN_PPG);
   ppgBrut = brut;
 
-  // Détection physique nette du doigt posé
-  if (brut < 180 || brut > 980) {
+  // Détection nette de la présence du doigt
+  if (brut < 200 || brut > 980) {
     doigtPresentVolatile = false;
     bpmCalculeVolatile = 0;
-    ppgNormHauteur = 0;
     enPicInterne = false;
     ppgLisse = brut;
     ppgBase = brut;
@@ -164,57 +169,59 @@ ISR(TIMER1_COMPA_vect) {
 
   doigtPresentVolatile = true;
 
-  // Filtrage passe-bas et extraction continue (DC)
+  // Filtrage passe-bas et suivi de la ligne de base (DC)
   ppgLisse += 0.20f * (brut - ppgLisse);
-  ppgBase  += 0.02f * (ppgLisse - ppgBase);
+  ppgBase  += 0.015f * (ppgLisse - ppgBase);
   float ac = ppgLisse - ppgBase;
-  ppgAC = ac;
 
-  // Suivi de l'enveloppe crête
+  // Suivi dynamique de l'amplitude crête
   if (abs(ac) > ppgCrete) {
     ppgCrete = abs(ac);
   } else {
-    ppgCrete *= 0.992f;
+    ppgCrete *= 0.994f;
     if (ppgCrete < 15.0f) ppgCrete = 15.0f;
   }
 
-  // Normalisation symétrique centrée de 0 à 34 pixels
+  // Normalisation centrée de l'onde
   float n = 0.5f + (ac / (2.0f * ppgCrete));
   if (n > 1.0f) n = 1.0f;
   if (n < 0.0f) n = 0.0f;
-  ppgNormHauteur = (uint8_t)(n * 34.0f);
 
-  // Trigger de Schmitt pour détection des battements
+  // Écriture continue dans le tampon interne
+  compteurEchelle++;
+  if (compteurEchelle >= ECHELLES_DIVISEUR[indexEchelle]) {
+    compteurEchelle = 0;
+    bufferPPG_Interne[indexTraceInterne] = (uint8_t)(n * 34.0f);
+    indexTraceInterne = (indexTraceInterne + 1) % LARGEUR_TRACE;
+  }
+
+  // Trigger de Schmitt avec période réfractaire de 480 ms pour bloquer l'onde dicrote
   if (!enPicInterne) {
-    if (n > 0.60f && (tempsMsInterne - tempsDernierPic > 360)) {
+    if (n > 0.65f && (tempsMsInterne - tempsDernierPic > 480)) {
       enPicInterne = true;
       unsigned long dt = tempsMsInterne - tempsDernierPic;
       tempsDernierPic = tempsMsInterne;
 
-      if (dt >= 360 && dt <= 1600) {
+      if (dt >= 480 && dt <= 1600) {
         int bpmInst = 60000UL / dt;
-        if (bpmCalculeVolatile == 0) bpmCalculeVolatile = bpmInst;
-        else bpmCalculeVolatile = (bpmCalculeVolatile * 3 + bpmInst) / 4;
+        if (bpmCalculeVolatile == 0) {
+          bpmCalculeVolatile = bpmInst;
+        } else {
+          // Lissage pondéré
+          bpmCalculeVolatile = (bpmCalculeVolatile * 3 + bpmInst) / 4;
+        }
         nouveauBattement = true;
       }
     }
   } else {
     if (n < 0.35f) {
-      enPicInterne = false; // Réarmé
+      enPicInterne = false; // Réarmement
     }
-  }
-
-  // Enregistrement dans le buffer de l'oscilloscope selon l'échelle
-  compteurEchelle++;
-  if (compteurEchelle >= ECHELLES_DIVISEUR[indexEchelle]) {
-    compteurEchelle = 0;
-    bufferPPG[indexTrace] = ppgNormHauteur;
-    indexTrace = (indexTrace + 1) % LARGEUR_TRACE;
   }
 }
 
 // =============================================================================
-// 4. GESTION EEPROM
+// 5. FONCTIONS EEPROM
 // =============================================================================
 void initialiserEEPROM() {
   uint16_t magic;
@@ -272,7 +279,7 @@ MesureEEPROM lireMesure(uint8_t index) {
 }
 
 // =============================================================================
-// 5. ACTIONNEURS
+// 6. ACTIONNEURS : LED RGB ET BUZZER
 // =============================================================================
 void actualiserActionneurs() {
   if (!doigtPresent || bpmAffiche < 35 || bpmAffiche > 220) {
@@ -283,16 +290,19 @@ void actualiserActionneurs() {
   }
 
   if (bpmAffiche < 60) {
+    // Bradycardie : Jaune (Rouge + Vert haché)
     digitalWrite(PIN_LED_BLEU, LOW);
     digitalWrite(PIN_LED_ROUGE, HIGH);
     static byte cpt = 0;
     cpt = (cpt + 1) % 4;
     digitalWrite(PIN_LED_VERT, (cpt == 0) ? HIGH : LOW);
   } else if (bpmAffiche <= 100) {
+    // Normocardie : Vert
     digitalWrite(PIN_LED_ROUGE, LOW);
     digitalWrite(PIN_LED_VERT, HIGH);
     digitalWrite(PIN_LED_BLEU, LOW);
   } else {
+    // Tachycardie : Rouge
     digitalWrite(PIN_LED_ROUGE, HIGH);
     digitalWrite(PIN_LED_VERT, LOW);
     digitalWrite(PIN_LED_BLEU, LOW);
@@ -310,11 +320,12 @@ void declencherBip() {
 }
 
 // =============================================================================
-// 6. DESSIN DES ÉCRANS
+// 7. FONCTIONS D'AFFICHAGE GRAPHIQUE
 // =============================================================================
 void dessinerEcran1() {
   ecran1.firstPage();
   do {
+    // Affichage de la jauge d'appui long / court
     if (boutonEstEnfonce) {
       ecran1.setFont(u8g2_font_6x10_tf);
       ecran1.drawStr(14, 18, (langueActive == FR) ? "APPUI EN COURS..." : "HOLDING...");
@@ -336,6 +347,7 @@ void dessinerEcran1() {
       continue;
     }
 
+    // Mode Normal
     if (modeActuel == MODE_NORMAL) {
       ecran1.setFont(u8g2_font_helvB14_tf);
       ecran1.drawStr(22, 22, strHeure);
@@ -364,6 +376,7 @@ void dessinerEcran1() {
         ecran1.drawStr(12, 60, (langueActive == FR) ? "2s=Menu  5s=Sauver" : "2s=Menu  5s=Save");
       }
     } 
+    // Mode Historique
     else if (modeActuel == MODE_HISTORIQUE) {
       ecran1.setFont(u8g2_font_6x10_tf);
       ecran1.drawStr(4, 10, (langueActive == FR) ? "HISTORIQUE" : "HISTORY");
@@ -392,6 +405,7 @@ void dessinerEcran1() {
       ecran1.setFont(u8g2_font_4x6_tf);
       ecran1.drawStr(4, 60, (langueActive == FR) ? "Rot=Defiler  2s=Options" : "Rot=Scroll  2s=Options");
     }
+    // Mode Options
     else if (modeActuel == MODE_OPTIONS) {
       ecran1.setFont(u8g2_font_6x10_tf);
       ecran1.drawStr(4, 10, "OPTIONS");
@@ -412,6 +426,7 @@ void dessinerEcran1() {
 void dessinerEcran2() {
   ecran2.firstPage();
   do {
+    // Titre et échelle
     ecran2.setFont(u8g2_font_6x10_tf);
     ecran2.drawStr(4, 10, "PPG");
     ecran2.drawStr(78, 10, NOMS_ECHELLES[indexEchelle]);
@@ -434,21 +449,17 @@ void dessinerEcran2() {
     ecran2.drawVLine(18 + 58, Y_BASE, 3);
     ecran2.drawVLine(18 + 87, Y_BASE, 3);
 
-    // Tracé de la courbe
+    // Tracé de la courbe à partir du buffer figé (aucun décalage en cours de dessin)
     for (byte i = 0; i < LARGEUR_TRACE - 1; i++) {
-      byte idx1 = (indexTrace + i) % LARGEUR_TRACE;
-      byte idx2 = (indexTrace + i + 1) % LARGEUR_TRACE;
-
-      byte y1 = Y_BASE - bufferPPG[idx1];
-      byte y2 = Y_BASE - bufferPPG[idx2];
-
+      byte y1 = Y_BASE - bufferPPG_Affiche[i];
+      byte y2 = Y_BASE - bufferPPG_Affiche[i + 1];
       ecran2.drawLine(18 + i, y1, 18 + i + 1, y2);
     }
   } while (ecran2.nextPage());
 }
 
 // =============================================================================
-// 7. SETUP
+// 8. INITIALISATION (SETUP)
 // =============================================================================
 void setup() {
   Serial.begin(115200);
@@ -471,39 +482,42 @@ void setup() {
   if (Rtc.GetIsWriteProtected()) Rtc.SetIsWriteProtected(false);
   if (!Rtc.GetIsRunning()) Rtc.SetIsRunning(true);
 
-  // Initialisation Écrans
+  // Initialisation des deux écrans
   ecran1.begin();
   ecran2.begin();
 
   initialiserEEPROM();
 
-  for (byte i = 0; i < LARGEUR_TRACE; i++) bufferPPG[i] = 0;
+  for (byte i = 0; i < LARGEUR_TRACE; i++) {
+    bufferPPG_Interne[i] = 0;
+    bufferPPG_Affiche[i] = 0;
+  }
 
-  // Interruption PCINT Encodeur
+  // Interruption PCINT sur l'encodeur (D10 / D12)
   cli();
   PCICR |= (1 << PCIE0);
   PCMSK0 |= (1 << PCINT2) | (1 << PCINT4);
 
-  // --- CONFIGURATION DU TIMER 1 À 100 Hz (10 ms) ---
+  // Configuration du Timer 1 à 100 Hz strict (10 ms)
   TCCR1A = 0;
   TCCR1B = 0;
   TCNT1  = 0;
-  OCR1A = 2499;             // (16 000 000 / (64 * 100)) - 1 = 2499 -> 100 Hz exact
+  OCR1A = 2499;             // 16MHz / (64 * 100Hz) - 1 = 2499
   TCCR1B |= (1 << WGM12);   // Mode CTC
   TCCR1B |= (1 << CS11) | (1 << CS10); // Prescaler 64
-  TIMSK1 |= (1 << OCIE1A);  // Active interruption Compare Match A
+  TIMSK1 |= (1 << OCIE1A);  // Interruption Compare Match A
   sei();
 
-  Serial.println(F("=== SYSTEME AVEC TIMER1 PRET ==="));
+  Serial.println(F("=== SYSTEME COMPLET FINALISE ==="));
 }
 
 // =============================================================================
-// 8. LOOP
+// 9. BOUCLE PRINCIPALE (LOOP)
 // =============================================================================
 void loop() {
   unsigned long maintenant = millis();
 
-  // Récupération atomique des variables calculées par le Timer1
+  // 1. Récupération atomique des variables du Timer 1
   cli();
   doigtPresent = doigtPresentVolatile;
   bpmAffiche = bpmCalculeVolatile;
@@ -511,15 +525,13 @@ void loop() {
   nouveauBattement = false;
   sei();
 
-  // Bip au battement
+  // 2. Gestion du Bip au battement et de la LED RGB
   if (sonBip) {
     declencherBip();
   }
-
-  // Actualisation LED
   actualiserActionneurs();
 
-  // Bouton Mute FS4 (D9)
+  // 3. Bouton Mute FS4 (D9)
   bool lectureMute = digitalRead(PIN_BOUTON_MUTE);
   if (lectureMute != dernierEtatMute && (maintenant - dernierDebounceMute > 50)) {
     if (lectureMute == LOW) {
@@ -530,7 +542,7 @@ void loop() {
   }
   dernierEtatMute = lectureMute;
 
-  // Encodeur et Menu
+  // 4. Navigation par rotation d'encodeur
   if (deltaEncodeur != 0) {
     if (modeActuel == MODE_HISTORIQUE && nbMesuresStockees > 0) {
       indexHistorique += deltaEncodeur;
@@ -542,6 +554,7 @@ void loop() {
     deltaEncodeur = 0;
   }
 
+  // 5. Gestion de l'axe poussoir de l'encodeur (D11)
   bool lectureSW = digitalRead(PIN_ENC_SW);
   if (lectureSW == LOW) {
     if (!boutonEstEnfonce) {
@@ -556,6 +569,7 @@ void loop() {
       dureeAppuiCourante = 0;
 
       if (dureeTotale >= SEUIL_APPUI_LONG_MS) {
+        // Appui long (>= 5s)
         if (modeActuel == MODE_NORMAL && !acquisitionEnCours) {
           acquisitionEnCours = true;
           compteurEchantillons = 0;
@@ -569,6 +583,7 @@ void loop() {
           }
         }
       } else if (dureeTotale >= SEUIL_APPUI_COURT_MS) {
+        // Appui court (1.5s à 5s)
         if (modeActuel == MODE_NORMAL) modeActuel = MODE_HISTORIQUE;
         else if (modeActuel == MODE_HISTORIQUE) modeActuel = MODE_OPTIONS;
         else modeActuel = MODE_NORMAL;
@@ -576,7 +591,7 @@ void loop() {
     }
   }
 
-  // Moyenne EEPROM sur 10 points
+  // 6. Calcul de la moyenne sur 10 points (FS6)
   if (acquisitionEnCours && (maintenant - dernierEchantillonMoyenne >= 150)) {
     dernierEchantillonMoyenne = maintenant;
     int mesureBpm = (bpmAffiche > 0) ? bpmAffiche : 70;
@@ -591,7 +606,7 @@ void loop() {
     }
   }
 
-  // Rafraîchissement des écrans
+  // 7. Rafraîchissement Écran 1 (Heure / Pouls / Menu)
   unsigned long intervalleEcran1 = (boutonEstEnfonce || acquisitionEnCours) ? 100 : 1000;
   if (maintenant - dernierAffichageHeure >= intervalleEcran1) {
     dernierAffichageHeure = maintenant;
@@ -600,8 +615,18 @@ void loop() {
     dessinerEcran1();
   }
 
+  // 8. Rafraîchissement Écran 2 (Oscilloscope PPG) avec copie miroir
   if (maintenant - dernierAffichagePPG >= 60) {
     dernierAffichagePPG = maintenant;
+
+    // Fige le tampon interne dans l'ordre chronologique sans bloquer le Timer
+    cli();
+    byte head = indexTraceInterne;
+    for (byte i = 0; i < LARGEUR_TRACE; i++) {
+      bufferPPG_Affiche[i] = bufferPPG_Interne[(head + i) % LARGEUR_TRACE];
+    }
+    sei();
+
     dessinerEcran2();
   }
 }
