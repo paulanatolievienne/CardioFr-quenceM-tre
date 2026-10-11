@@ -1,32 +1,156 @@
+
 #include <Arduino.h>
-#include <HeartRateProcessor.h>
 
-const int pulsePin = A2;
+const byte PIN_PPG = A0;
 
-HeartRateProcessor heartProcessor;
+// Echantillonnage
+const unsigned long PERIODE_MS = 5;
+
+// Parametres de detection a ajuster selon le signal
+const int AMPLITUDE_MIN = 100;
+const unsigned long INTERVALLE_MIN = 350;
+const unsigned long INTERVALLE_MAX = 2000;
+
+// Lissage du signal
+const float ALPHA = 0.25f;
+
+// Historique des intervalles
+const byte NB_INTERVALLES = 5;
+unsigned long intervalles[NB_INTERVALLES];
+byte nbIntervalles = 0;
+byte indexIntervalle = 0;
+
+// Variables de mesure
+unsigned long derniereLecture = 0;
+unsigned long dernierBattement = 0;
+
+float signalFiltre = 0;
+float ancienSignalFiltre = 0;
+float precedentSignalFiltre = 0;
+
+int minimumLocal = 1023;
+int maximumLocal = 0;
+
+bool initialise = false;
+bool recherchePic = true;
+bool premierBattement = true;
+
+void ajouterIntervalle(unsigned long intervalle) {
+  intervalles[indexIntervalle] = intervalle;
+  indexIntervalle = (indexIntervalle + 1) % NB_INTERVALLES;
+
+  if (nbIntervalles < NB_INTERVALLES) {
+    nbIntervalles++;
+  }
+}
+
+float calculerBPM() {
+  unsigned long somme = 0;
+
+  for (byte i = 0; i < nbIntervalles; i++) {
+    somme += intervalles[i];
+  }
+
+  if (nbIntervalles == 0) return 0;
+
+  return 60000.0f * nbIntervalles / somme;
+}
+
+bool intervalleCoherent(unsigned long intervalle) {
+  if (nbIntervalles < 3) return true;
+
+  unsigned long precedent =
+      intervalles[(indexIntervalle + NB_INTERVALLES - 1)
+                  % NB_INTERVALLES];
+
+  float ecart = abs((long)intervalle - (long)precedent);
+
+  return ecart <= precedent * 0.30f;
+}
 
 void setup() {
   Serial.begin(115200);
-  pinMode(pulsePin, INPUT);
 }
 
 void loop() {
-  unsigned long now = millis();
+  unsigned long maintenant = millis();
 
-  static unsigned long lastSample = 0;
-  if (now - lastSample >= 20) {
-    lastSample = now;
+  if (maintenant - derniereLecture < PERIODE_MS) return;
+  derniereLecture = maintenant;
 
-    int rawSignal = analogRead(pulsePin);
-    heartProcessor.processSample(rawSignal, now);
+  int brut = analogRead(PIN_PPG);
 
-    Serial.print(F(">signal:"));
-    Serial.println(rawSignal);
-    Serial.print(F(">seuil:"));
-    Serial.println(heartProcessor.threshold);
-    Serial.print(F(">battement:"));
-    Serial.println(heartProcessor.pulseDetected ? 600 : 450);
-    Serial.print(F(">bpm:"));
-    Serial.println(heartProcessor.bpm);
+  if (!initialise) {
+    signalFiltre = brut;
+    ancienSignalFiltre = brut;
+    precedentSignalFiltre = brut;
+    minimumLocal = brut;
+    maximumLocal = brut;
+    initialise = true;
+    return;
   }
+
+  // Filtrage passe-bas
+  signalFiltre += ALPHA * (brut - signalFiltre);
+
+  // Suivi du minimum et du maximum de la pulsation
+  if (signalFiltre < minimumLocal) {
+    minimumLocal = (int)signalFiltre;
+  }
+
+  if (signalFiltre > maximumLocal) {
+    maximumLocal = (int)signalFiltre;
+  }
+
+  // Recherche du sommet : le signal monte puis redescend
+  bool sommet =
+      (ancienSignalFiltre > precedentSignalFiltre) &&
+      (ancienSignalFiltre >= signalFiltre);
+
+  if (recherchePic && sommet) {
+    int amplitude = maximumLocal - minimumLocal;
+
+    if (amplitude >= AMPLITUDE_MIN) {
+      unsigned long instantPic = maintenant - PERIODE_MS;
+
+      if (premierBattement) {
+        dernierBattement = instantPic;
+        premierBattement = false;
+      } else {
+        unsigned long intervalle = instantPic - dernierBattement;
+
+        if (intervalle > INTERVALLE_MAX) {
+          // Perte de synchronisation : repartir de zero
+          dernierBattement = instantPic;
+          nbIntervalles = 0;
+          indexIntervalle = 0;
+        } else if (intervalle >= INTERVALLE_MIN &&
+                   intervalleCoherent(intervalle)) {
+          ajouterIntervalle(intervalle);
+          dernierBattement = instantPic;
+
+          if (nbIntervalles >= 3) {
+            Serial.print("BPM: ");
+            Serial.println(calculerBPM(), 1);
+          }
+        }
+      }
+
+      // Un seul comptage jusqu'au prochain cycle
+      recherchePic = false;
+      minimumLocal = (int)signalFiltre;
+      maximumLocal = (int)signalFiltre;
+    }
+  }
+
+  // Réarmer quand un nouveau creux est atteint
+  if (!recherchePic &&
+      signalFiltre < minimumLocal + 20) {
+    recherchePic = true;
+    minimumLocal = (int)signalFiltre;
+    maximumLocal = (int)signalFiltre;
+  }
+
+  precedentSignalFiltre = ancienSignalFiltre;
+  ancienSignalFiltre = signalFiltre;
 }
