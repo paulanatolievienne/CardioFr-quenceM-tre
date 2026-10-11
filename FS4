@@ -1,65 +1,126 @@
 #include <Arduino.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
 
-const int buzzer = 2;
+// --- Broches réelles ---
+const byte PIN_BUZZER = 5; // D5
+const byte PIN_BOUTON = 9; // D9 (câblé vers GND)
 
-// --- Écran OLED SSD1306 (I2C) ---
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET -1       // pas de broche reset dédiée sur la plupart des modules I2C
-#define SCREEN_ADDRESS 0x3C // à ajuster selon votre module (0x3C ou 0x3D)
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+// --- Fréquences sonores adaptées aux personnes malvoyantes (ET4.2) ---
+const unsigned int FREQ_GRAVE   = 440;  // Rythme faible (<60 BPM)
+const unsigned int FREQ_MODEREE = 880;  // Rythme normal (60-100 BPM)
+const unsigned int FREQ_AIGUE   = 1760; // Rythme élevé (>100 BPM)
 
-// --- Niveaux de rythme cardiaque ---
-const int nbNiveaux = 3;
-const int bpmNiveaux[nbNiveaux] = {60, 100, 120};
-const int frequenceNiveaux[nbNiveaux] = {440, 1000, 2000}; // grave, moyen, aigu
-int niveauActuel = 0;
+// Seuils cardiologiques (cohérence avec FS3)
+const float SEUIL_BRADYCARDIE = 60.0f;
+const float SEUIL_TACHYCARDIE = 100.0f;
+const float BPM_MIN_VALIDE    = 35.0f;
+const float BPM_MAX_VALIDE    = 220.0f;
 
-const unsigned long dureeBip = 100; // ms de bip audible
+// --- Gestion temporelle non-bloquante du son ---
+const unsigned long DUREE_BIP_MS = 40; // Impulsion sonore brève de 40 ms
+unsigned long debutBip = 0;
+bool sonEnCours = false;
 
-unsigned long dernierBattement = 0;
-unsigned long periode = 60000UL / bpmNiveaux[niveauActuel];
+// --- Gestion de l'interruption / Mute (ET4.3) ---
+bool sonActive = true;
+bool dernierEtatBouton = HIGH;
+unsigned long dernierAntiRebond = 0;
+const unsigned long DELAI_ANTI_REBOND_MS = 50;
 
-// --- Défilement automatique des niveaux ---
-const unsigned long intervalleDefilement = 5000; // ms entre chaque niveau
-unsigned long dernierDefilement = 0;
+// Variables pour le test de simulation
+float bpmActuel = 75.0f;
+bool contactPresent = true;
+unsigned long dernierBattementSimule = 0;
 
-void afficherRythme() {
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println("Rythme:");
-  display.setCursor(0, 30);
-  display.print(bpmNiveaux[niveauActuel]);
-  display.println(" BPM");
-  display.display();
+// Déclenchement d'un bip synchronisé (ET4.1 et ET4.2)
+void declencherBip(float bpm, bool contact) {
+  if (!sonActive || !contact || bpm < BPM_MIN_VALIDE || bpm > BPM_MAX_VALIDE) {
+    return;
+  }
+
+  unsigned int freq = FREQ_MODEREE;
+  if (bpm < SEUIL_BRADYCARDIE) {
+    freq = FREQ_GRAVE;
+  } else if (bpm > SEUIL_TACHYCARDIE) {
+    freq = FREQ_AIGUE;
+  }
+
+  tone(PIN_BUZZER, freq);
+  debutBip = millis();
+  sonEnCours = true;
+}
+
+// Coupure automatique sans delay()
+void gererFinBip() {
+  if (sonEnCours && (millis() - debutBip >= DUREE_BIP_MS)) {
+    noTone(PIN_BUZZER);
+    sonEnCours = false;
+  }
+}
+
+// Surveillance du bouton poussoir avec anti-rebond (ET4.3)
+void verifierBoutonInterruption() {
+  bool lecture = digitalRead(PIN_BOUTON);
+  unsigned long maintenant = millis();
+
+  if (lecture != dernierEtatBouton) {
+    if (maintenant - dernierAntiRebond > DELAI_ANTI_REBOND_MS) {
+      if (lecture == LOW) { // Front descendant : pression sur le bouton
+        sonActive = !sonActive;
+        if (!sonActive) {
+          noTone(PIN_BUZZER); // Coupure instantanée si un son était émis
+          sonEnCours = false;
+        }
+        Serial.print(F("-> Bouton presse : Son "));
+        Serial.println(sonActive ? F("ACTIVE (ON)") : F("COUPE (MUTE)"));
+      }
+      dernierAntiRebond = maintenant;
+    }
+  }
+  dernierEtatBouton = lecture;
 }
 
 void setup() {
-  pinMode(buzzer, OUTPUT);
+  Serial.begin(115200);
 
-  display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
-  afficherRythme();
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_BOUTON, INPUT_PULLUP);
+
+  Serial.println(F("=== Test Unitaire FS4 : Buzzer (D5) & Bouton (D9) ==="));
+  Serial.println(F("Commandes console : saisis 50, 75, 120 ou 0"));
+  Serial.println(F("Appuie sur le bouton pour basculer Mute / Unmute."));
 }
 
 void loop() {
   unsigned long maintenant = millis();
 
-  // Défilement automatique des niveaux toutes les 5 secondes
-  if (maintenant - dernierDefilement >= intervalleDefilement) {
-    dernierDefilement = maintenant;
-    niveauActuel = (niveauActuel + 1) % nbNiveaux;
-    periode = 60000UL / bpmNiveaux[niveauActuel];
-    afficherRythme();
+  // 1. Écoute du bouton avec latence minimale (ET4.3)
+  verifierBoutonInterruption();
+
+  // 2. Gestion de l'extinction du bip
+  gererFinBip();
+
+  // 3. Réception de valeurs de test via le moniteur série
+  if (Serial.available() > 0) {
+    float val = Serial.parseFloat();
+    while (Serial.available() > 0) {
+      Serial.read();
+      delay(2);
+    }
+
+    bpmActuel = val;
+    contactPresent = (val > 0);
+
+    Serial.print(F("Reglage BPM teste : "));
+    Serial.println(bpmActuel);
   }
 
-  // Battement du buzzer au rythme et à la fréquence du niveau sélectionné
-  if (maintenant - dernierBattement >= periode) {
-    dernierBattement = maintenant;
-    tone(buzzer, frequenceNiveaux[niveauActuel], dureeBip);
+  // 4. Génération périodique des bips au tempo cardiaque (ET4.1)
+  if (contactPresent && bpmActuel >= BPM_MIN_VALIDE && bpmActuel <= BPM_MAX_VALIDE) {
+    unsigned long periodeBattement = (unsigned long)(60000.0f / bpmActuel);
+    if (maintenant - dernierBattementSimule >= periodeBattement) {
+      dernierBattementSimule = maintenant;
+      declencherBip(bpmActuel, contactPresent);
+      Serial.println(F("* Bip ! *"));
+    }
   }
 }
