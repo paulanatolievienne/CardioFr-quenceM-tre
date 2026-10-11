@@ -1,1 +1,342 @@
+#include <Arduino.h>
+#include <EEPROM.h>
+#include <U8g2lib.h>
+#include <ThreeWire.h>
+#include <RtcDS1302.h>
 
+// --- RTC DS1302 (D2, D3, D4) ---
+const int RST_PIN = 2; // CE
+const int DAT_PIN = 3; // IO
+const int CLK_PIN = 4; // SCLK
+ThreeWire monFil(DAT_PIN, CLK_PIN, RST_PIN);
+RtcDS1302<ThreeWire> Rtc(monFil);
+
+// --- Écran 1 pour le menu (A4 = SCL, A3 = SDA) ---
+U8G2_SSD1306_128X64_NONAME_1_SW_I2C u8g2(U8G2_R0, /* clock=*/ A4, /* data=*/ A3, /* reset=*/ U8X8_PIN_NONE);
+
+// --- Encodeur EC11 ---
+const byte PIN_ENC_A  = 10;
+const byte PIN_ENC_B  = 12;
+const byte PIN_ENC_SW = 11; // Axe poussoir (S2)
+
+// --- Buzzer & Bouton FS4 préservé ---
+const byte PIN_BUZZER = 5;
+const byte PIN_BOUTON_MUTE = 9; // Dédié exclusivement au son FS4
+
+// --- Structure de données en EEPROM (ET6.1, ET6.3) ---
+#define ADRESSE_MAGIC       0    
+#define ADRESSE_NB_MESURES  2    
+#define ADRESSE_LANGUE      3    
+#define ADRESSE_DEBUT_DATA  4    
+#define MAX_MESURES         10
+const uint16_t EEPROM_MAGIC = 0xCAFE;
+
+struct MesureEEPROM {
+  uint8_t bpm;
+  uint8_t jour;
+  uint8_t mois;
+  uint8_t annee; // offset année 2000
+  uint8_t heure;
+  uint8_t minute;
+  uint8_t seconde;
+};
+
+// --- États du système ---
+enum Langue { FR = 0, EN = 1 };
+Langue langueActive = FR;
+
+enum ModeEcran { MODE_NORMAL, MODE_HISTORIQUE, MODE_OPTIONS };
+ModeEcran modeActuel = MODE_NORMAL;
+
+int indexHistorique = 0;
+uint8_t nbMesuresStockees = 0;
+byte optionSelectionnee = 0; // 0 = Langue, 1 = Effacer
+
+// Moyenne de 10 mesures (ET6.2)
+bool acquisitionEnCours = false;
+uint8_t compteurEchantillons = 0;
+uint16_t sommeBpm = 0;
+unsigned long dernierEchantillon = 0;
+
+// Gestion Encodeur & Interruption
+volatile int deltaEncodeur = 0;
+volatile unsigned long dernierTempsInterruption = 0;
+
+// Détection Appui Court / Long sur D11
+bool etatPrecedentSW = HIGH;
+unsigned long tempsDebutAppui = 0;
+const unsigned long SEUIL_APPUI_LONG_MS = 600;
+
+// Variables pour bouton Mute (FS4)
+bool sonActif = true;
+bool dernierEtatMute = HIGH;
+unsigned long dernierDebounceMute = 0;
+
+unsigned long dernierAffichage = 0;
+
+// Interruption PCINT pour les crans de rotation (D10 / D12)
+ISR(PCINT0_vect) {
+  uint8_t etatA = (PINB & (1 << PINB2)) ? HIGH : LOW;
+  uint8_t etatB = (PINB & (1 << PINB4)) ? HIGH : LOW;
+
+  unsigned long maintenant = millis();
+  if (etatA == LOW && (maintenant - dernierTempsInterruption > 40)) {
+    dernierTempsInterruption = maintenant;
+    if (etatB == HIGH) {
+      deltaEncodeur++;
+    } else {
+      deltaEncodeur--;
+    }
+  }
+}
+
+// EEPROM
+void initialiserEEPROM() {
+  uint16_t magic;
+  EEPROM.get(ADRESSE_MAGIC, magic);
+  if (magic != EEPROM_MAGIC) {
+    EEPROM.put(ADRESSE_MAGIC, EEPROM_MAGIC);
+    nbMesuresStockees = 0;
+    EEPROM.write(ADRESSE_NB_MESURES, 0);
+    langueActive = FR;
+    EEPROM.write(ADRESSE_LANGUE, (uint8_t)FR);
+  } else {
+    nbMesuresStockees = EEPROM.read(ADRESSE_NB_MESURES);
+    if (nbMesuresStockees > MAX_MESURES) nbMesuresStockees = 0;
+    langueActive = (Langue)EEPROM.read(ADRESSE_LANGUE);
+    if (langueActive > EN) langueActive = FR;
+  }
+}
+
+void effacerHistoriqueEEPROM() {
+  nbMesuresStockees = 0;
+  EEPROM.write(ADRESSE_NB_MESURES, 0);
+  indexHistorique = 0;
+  Serial.println(F("EEPROM : Historique efface."));
+}
+
+void sauvegarderMesure(uint8_t bpmMoyen, RtcDateTime dt) {
+  MesureEEPROM m;
+  m.bpm = bpmMoyen;
+  m.jour = dt.Day();
+  m.mois = dt.Month();
+  m.annee = (uint8_t)(dt.Year() - 2000);
+  m.heure = dt.Hour();
+  m.minute = dt.Minute();
+  m.seconde = dt.Second();
+
+  if (nbMesuresStockees >= MAX_MESURES) {
+    for (int i = 0; i < MAX_MESURES - 1; i++) {
+      MesureEEPROM temp;
+      EEPROM.get(ADRESSE_DEBUT_DATA + (i + 1) * sizeof(MesureEEPROM), temp);
+      EEPROM.put(ADRESSE_DEBUT_DATA + i * sizeof(MesureEEPROM), temp);
+    }
+    nbMesuresStockees = MAX_MESURES - 1;
+  }
+
+  int adresse = ADRESSE_DEBUT_DATA + nbMesuresStockees * sizeof(MesureEEPROM);
+  EEPROM.put(adresse, m);
+  nbMesuresStockees++;
+  EEPROM.write(ADRESSE_NB_MESURES, nbMesuresStockees);
+
+  Serial.print(F("EEPROM : Moyenne enregistree -> "));
+  Serial.print(bpmMoyen);
+  Serial.println(F(" BPM"));
+}
+
+MesureEEPROM lireMesure(uint8_t index) {
+  MesureEEPROM m;
+  int adresse = ADRESSE_DEBUT_DATA + index * sizeof(MesureEEPROM);
+  EEPROM.get(adresse, m);
+  return m;
+}
+
+// Affichage écran
+void dessinerInterface() {
+  u8g2.firstPage();
+  do {
+    if (modeActuel == MODE_NORMAL) {
+      RtcDateTime dt = Rtc.GetDateTime();
+      char bufH[9];
+      snprintf(bufH, sizeof(bufH), "%02d:%02d:%02d", dt.Hour(), dt.Minute(), dt.Second());
+
+      u8g2.setFont(u8g2_font_helvB14_tf);
+      u8g2.drawStr(22, 22, bufH);
+      u8g2.drawHLine(14, 28, 100);
+
+      u8g2.setFont(u8g2_font_6x10_tf);
+      if (acquisitionEnCours) {
+        u8g2.drawStr(10, 42, (langueActive == FR) ? "ENREGISTREMENT..." : "RECORDING...");
+        u8g2.drawFrame(14, 48, 100, 8);
+        u8g2.drawBox(14, 48, compteurEchantillons * 10, 8);
+      } else {
+        u8g2.drawStr(14, 44, (langueActive == FR) ? "POULS : 72 bpm" : "PULSE : 72 bpm");
+        u8g2.setFont(u8g2_font_4x6_tf);
+        u8g2.drawStr(8, 58, (langueActive == FR) ? "Appui court=Menu  Long=Sauver" : "Short=Menu  Long=Save");
+      }
+    } 
+    else if (modeActuel == MODE_HISTORIQUE) {
+      u8g2.setFont(u8g2_font_6x10_tf);
+      u8g2.drawStr(4, 10, (langueActive == FR) ? "HISTORIQUE" : "HISTORY");
+
+      char bufInd[10];
+      snprintf(bufInd, sizeof(bufInd), "%d/%d", (nbMesuresStockees > 0) ? (indexHistorique + 1) : 0, nbMesuresStockees);
+      u8g2.drawStr(92, 10, bufInd);
+      u8g2.drawHLine(4, 13, 120);
+
+      if (nbMesuresStockees == 0) {
+        u8g2.drawStr(20, 36, (langueActive == FR) ? "Aucune mesure" : "No records");
+      } else {
+        MesureEEPROM m = lireMesure(indexHistorique);
+
+        u8g2.setFont(u8g2_font_helvB14_tf);
+        char bufBpm[12];
+        snprintf(bufBpm, sizeof(bufBpm), "%d bpm", m.bpm);
+        u8g2.drawStr(10, 34, bufBpm);
+
+        u8g2.setFont(u8g2_font_5x7_tf);
+        char bufDH[22];
+        snprintf(bufDH, sizeof(bufDH), "%02d/%02d/20%02d %02d:%02d", m.jour, m.mois, m.annee, m.heure, m.minute);
+        u8g2.drawStr(10, 48, bufDH);
+      }
+
+      u8g2.setFont(u8g2_font_4x6_tf);
+      u8g2.drawStr(4, 60, (langueActive == FR) ? "Rot=Defiler  Court=Options" : "Rot=Scroll  Short=Options");
+    }
+    else if (modeActuel == MODE_OPTIONS) {
+      u8g2.setFont(u8g2_font_6x10_tf);
+      u8g2.drawStr(4, 10, "OPTIONS");
+      u8g2.drawHLine(4, 13, 120);
+
+      // Curseur de sélection (flèche >)
+      if (optionSelectionnee == 0) u8g2.drawStr(2, 28, ">");
+      else u8g2.drawStr(2, 42, ">");
+
+      // Ligne 1 : Langue
+      u8g2.drawStr(12, 28, (langueActive == FR) ? "Langue : [FR]" : "Language : [EN]");
+      // Ligne 2 : Effacement
+      u8g2.drawStr(12, 42, (langueActive == FR) ? "Effacer historique" : "Clear memory");
+
+      u8g2.setFont(u8g2_font_4x6_tf);
+      u8g2.drawStr(4, 58, (langueActive == FR) ? "Rot=Choix  Long=Valider  Court=Retour" : "Rot=Pick  Long=Select  Short=Back");
+    }
+  } while (u8g2.nextPage());
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_ENC_A, INPUT_PULLUP);
+  pinMode(PIN_ENC_B, INPUT_PULLUP);
+  pinMode(PIN_ENC_SW, INPUT_PULLUP);
+
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_BOUTON_MUTE, INPUT_PULLUP);
+
+  // Interruption PCINT pour la rotation de l'axe (D10 / D12)
+  cli();
+  PCICR |= (1 << PCIE0);
+  PCMSK0 |= (1 << PCINT2) | (1 << PCINT4);
+  sei();
+
+  Rtc.Begin();
+  if (Rtc.GetIsWriteProtected()) Rtc.SetIsWriteProtected(false);
+  if (!Rtc.GetIsRunning()) Rtc.SetIsRunning(true);
+
+  u8g2.begin();
+  initialiserEEPROM();
+
+  Serial.println(F("=== FS6 : Gestion 100% Encodeur ==="));
+}
+
+void loop() {
+  unsigned long maintenant = millis();
+
+  // 1. Gestion du bouton Mute (FS4 sur D9)
+  bool lectureMute = digitalRead(PIN_BOUTON_MUTE);
+  if (lectureMute != dernierEtatMute && (maintenant - dernierDebounceMute > 50)) {
+    if (lectureMute == LOW) {
+      sonActif = !sonActif;
+      if (!sonActif) noTone(PIN_BUZZER);
+      Serial.print(F("FS4 : Son "));
+      Serial.println(sonActif ? F("ON") : F("MUTE"));
+    }
+    dernierDebounceMute = maintenant;
+  }
+  dernierEtatMute = lectureMute;
+
+  // 2. Navigation par rotation de l'encodeur
+  if (deltaEncodeur != 0) {
+    if (modeActuel == MODE_HISTORIQUE && nbMesuresStockees > 0) {
+      indexHistorique += deltaEncodeur;
+      if (indexHistorique < 0) indexHistorique = 0;
+      if (indexHistorique >= nbMesuresStockees) indexHistorique = nbMesuresStockees - 1;
+    } else if (modeActuel == MODE_OPTIONS) {
+      optionSelectionnee = (optionSelectionnee == 0) ? 1 : 0;
+    }
+    deltaEncodeur = 0;
+  }
+
+  // 3. Gestion Appui Court / Appui Long sur l'axe encodeur (D11)
+  bool lectureSW = digitalRead(PIN_ENC_SW);
+  if (lectureSW != etatPrecedentSW) {
+    if (lectureSW == LOW) {
+      // Début d'appui
+      tempsDebutAppui = maintenant;
+    } else {
+      // Relâchement : analyse de la durée
+      unsigned long duree = maintenant - tempsDebutAppui;
+      if (duree >= 50 && duree < SEUIL_APPUI_LONG_MS) {
+        // --- APPUI COURT ---
+        if (modeActuel == MODE_NORMAL) {
+          modeActuel = MODE_HISTORIQUE;
+        } else if (modeActuel == MODE_HISTORIQUE) {
+          modeActuel = MODE_OPTIONS;
+        } else {
+          modeActuel = MODE_NORMAL;
+        }
+      } else if (duree >= SEUIL_APPUI_LONG_MS) {
+        // --- APPUI LONG ---
+        if (modeActuel == MODE_NORMAL && !acquisitionEnCours) {
+          // Lance la moyenne des 10 points (ET6.2)
+          acquisitionEnCours = true;
+          compteurEchantillons = 0;
+          sommeBpm = 0;
+          Serial.println(F("Appui long : Enregistrement de 10 points lance..."));
+        } else if (modeActuel == MODE_OPTIONS) {
+          if (optionSelectionnee == 0) {
+            // Bascule langue (ET6.5)
+            langueActive = (langueActive == FR) ? EN : FR;
+            EEPROM.write(ADRESSE_LANGUE, (uint8_t)langueActive);
+            Serial.println(F("Options : Langue modifiee"));
+          } else {
+            // Effacement (ET6.4)
+            effacerHistoriqueEEPROM();
+          }
+        }
+      }
+    }
+    etatPrecedentSW = lectureSW;
+  }
+
+  // 4. Calcul de la moyenne de 10 mesures (ET6.2)
+  if (acquisitionEnCours && (maintenant - dernierEchantillon >= 140)) {
+    dernierEchantillon = maintenant;
+    int mesureInstantanee = 70 + random(0, 5); // Simulé pour le test
+    sommeBpm += mesureInstantanee;
+    compteurEchantillons++;
+
+    if (compteurEchantillons >= 10) {
+      uint8_t bpmMoyen = sommeBpm / 10;
+      acquisitionEnCours = false;
+      sauvegarderMesure(bpmMoyen, Rtc.GetDateTime());
+      indexHistorique = nbMesuresStockees - 1;
+    }
+  }
+
+  // 5. Rafraîchissement de l'affichage
+  if (maintenant - dernierAffichage >= 90) {
+    dernierAffichage = maintenant;
+    dessinerInterface();
+  }
+}
