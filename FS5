@@ -1,0 +1,179 @@
+#include <Arduino.h>
+#include <U8g2lib.h>
+
+// --- Configuration des broches ---
+// Écran 1 : Heure & BPM (A4 = SCL, A3 = SDA)
+U8G2_SSD1306_128X64_NONAME_1_SW_I2C ecran1(U8G2_R0, /* clock=*/ A4, /* data=*/ A3, /* reset=*/ U8X8_PIN_NONE);
+
+// Écran 2 : Oscilloscope PPG gradué (A2 = SCL, A1 = SDA)
+U8G2_SSD1306_128X64_NONAME_1_SW_I2C ecran2(U8G2_R0, /* clock=*/ A2, /* data=*/ A1, /* reset=*/ U8X8_PIN_NONE);
+
+// Encodeur EC11
+const byte PIN_ENC_A  = 10;
+const byte PIN_ENC_B  = 12;
+const byte PIN_ENC_SW = 11;
+
+// --- Paramètres de l'oscilloscope PPG (ET5.2, ET5.3, ET5.4) ---
+const byte LARGEUR_TRACE = 90; // Pixels alloués au signal (x de 10 à 99)
+const byte HAUTEUR_TRACE = 40; // Pixels alloués (y de 14 à 54)
+const byte Y_BASE = 54;        // Ligne zéro sur l'écran
+
+uint8_t bufferPPG[LARGEUR_TRACE];
+byte indexTrace = 0;
+
+// Échelles de temps (décimation temporelle en ms par pixel)
+const uint8_t NB_ECHELLES = 3;
+const unsigned int ECHELLES_MS[NB_ECHELLES] = {10, 20, 40}; // 10ms/px (0.9s), 20ms/px (1.8s), 40ms/px (3.6s)
+const char* NOMS_ECHELLES[NB_ECHELLES] = {"10ms/pt", "20ms/pt", "40ms/pt"};
+volatile int8_t indexEchelle = 1; // Par défaut : 20 ms/pixel
+
+// Variables de gestion de l'encodeur
+byte dernierEtatA = HIGH;
+unsigned long dernierEchantillonPPG = 0;
+unsigned long dernierAffichageEcrans = 0;
+
+// Variables simulées pour le test FS5
+float bpmAffiche = 65.0f;
+bool doigtDetecte = true;
+char texteHeure[9] = "12:30:00";
+
+// Lecture de l'encodeur rotatif (ET5.4)
+void lireEncodeur() {
+  byte etatA = digitalRead(PIN_ENC_A);
+  if (etatA != dernierEtatA && etatA == LOW) { // Front descendant sur A
+    if (digitalRead(PIN_ENC_B) == HIGH) {
+      if (indexEchelle < NB_ECHELLES - 1) indexEchelle++;
+    } else {
+      if (indexEchelle > 0) indexEchelle--;
+    }
+    Serial.print(F("Base de temps modifiee : "));
+    Serial.println(NOMS_ECHELLES[indexEchelle]);
+  }
+  dernierEtatA = etatA;
+}
+
+// Générateur d'onde pour test visuel
+float genererOndeTest() {
+  static float phase = 0;
+  phase += 0.08f;
+  if (phase > 6.283f) phase -= 6.283f;
+  // Onde asymétrique simulant le pouls systolique + dicrote
+  float val = (sin(phase) + 0.5f * sin(2.0f * phase));
+  if (val < 0) val = 0;
+  return val / 1.5f; // Normalisé ~ [0.0 ; 1.0]
+}
+
+// Dessin Écran 1 : Heure & BPM (ET5.1)
+void dessinerEcran1() {
+  ecran1.firstPage();
+  do {
+    // Cadre décoratif
+    ecran1.drawRFrame(0, 0, 128, 64, 3);
+
+    // Heure
+    ecran1.setFont(u8g2_font_logisoso16_tf);
+    ecran1.drawStr(20, 24, texteHeure);
+
+    // Ligne de séparation
+    ecran1.drawHLine(10, 31, 108);
+
+    // Icône cœur & Fréquence
+    ecran1.setFont(u8g2_font_unifont_t_symbols);
+    ecran1.drawGlyph(16, 52, 0x2665); // Symbole cœur plein
+
+    ecran1.setFont(u8g2_font_profont17_tr);
+    if (doigtDetecte && bpmAffiche > 35.0f && bpmAffiche < 220.0f) {
+      char strBpm[10];
+      dtostrf(bpmAffiche, 3, 0, strBpm);
+      strcat(strBpm, " bpm");
+      ecran1.drawStr(38, 51, strBpm);
+    } else {
+      ecran1.drawStr(45, 51, "-- bpm"); // ET5.1
+    }
+  } while (ecran1.nextPage());
+}
+
+// Dessin Écran 2 : Graphique gradué avec échelle (ET5.2, ET5.3, ET5.4)
+void dessinerEcran2() {
+  ecran2.firstPage();
+  do {
+    // Titre et échelle active
+    ecran2.setFont(u8g2_font_6x10_tf);
+    ecran2.drawStr(4, 10, "PPG");
+    ecran2.drawStr(70, 10, NOMS_ECHELLES[indexEchelle]); // ET5.4
+
+    // Axes gradués (ET5.3)
+    ecran2.drawVLine(18, 12, 44); // Axe Y
+    ecran2.drawHLine(18, Y_BASE, LARGEUR_TRACE); // Axe X (temps)
+
+    // Graduations Y
+    ecran2.drawHLine(15, Y_BASE, 3);                 // 0.0
+    ecran2.drawHLine(15, Y_BASE - HAUTEUR_TRACE / 2, 3); // 0.5
+    ecran2.drawHLine(15, Y_BASE - HAUTEUR_TRACE, 3);     // 1.0
+
+    ecran2.setFont(u8g2_font_4x6_tf);
+    ecran2.drawStr(2, Y_BASE + 2, "0");
+    ecran2.drawStr(2, Y_BASE - HAUTEUR_TRACE + 5, "1");
+
+    // Repères temporels sur l'axe X (petits ticks tous les 30 pixels)
+    ecran2.drawVLine(18 + 30, Y_BASE, 3);
+    ecran2.drawVLine(18 + 60, Y_BASE, 3);
+    ecran2.drawVLine(18 + 90, Y_BASE, 3);
+
+    // Tracé de la courbe PPG
+    for (byte i = 0; i < LARGEUR_TRACE - 1; i++) {
+      byte idx1 = (indexTrace + i) % LARGEUR_TRACE;
+      byte idx2 = (indexTrace + i + 1) % LARGEUR_TRACE;
+
+      byte y1 = Y_BASE - bufferPPG[idx1];
+      byte y2 = Y_BASE - bufferPPG[idx2];
+
+      ecran2.drawLine(18 + i, y1, 18 + i + 1, y2);
+    }
+  } while (ecran2.nextPage());
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_ENC_A, INPUT_PULLUP);
+  pinMode(PIN_ENC_B, INPUT_PULLUP);
+  pinMode(PIN_ENC_SW, INPUT_PULLUP);
+
+  // Initialisation des deux écrans Software I2C
+  ecran1.begin();
+  ecran2.begin();
+
+  // Initialisation du tampon d'affichage
+  for (byte i = 0; i < LARGEUR_TRACE; i++) {
+    bufferPPG[i] = 0;
+  }
+
+  Serial.println(F("=== Test FS5 : Double OLED & Encodeur ==="));
+}
+
+void loop() {
+  unsigned long maintenant = millis();
+
+  // 1. Écoute réactive de l'encodeur rotatif
+  lireEncodeur();
+
+  // 2. Acquisition/actualisation des points du graphique selon la base de temps
+  unsigned int periodePoint = ECHELLES_MS[indexEchelle];
+  if (maintenant - dernierEchantillonPPG >= periodePoint) {
+    dernierEchantillonPPG = maintenant;
+
+    float norm = genererOndeTest(); // En intégration finale, on injectera acNormalise de FS1
+    uint8_t pixelH = (uint8_t)(norm * (HAUTEUR_TRACE - 2));
+
+    bufferPPG[indexTrace] = pixelH;
+    indexTrace = (indexTrace + 1) % LARGEUR_TRACE;
+  }
+
+  // 3. Rafraîchissement alterné des deux écrans pour préserver la fluidité
+  if (maintenant - dernierAffichageEcrans >= 60) { // ~15 FPS
+    dernierAffichageEcrans = maintenant;
+    dessinerEcran1();
+    dessinerEcran2();
+  }
+}
