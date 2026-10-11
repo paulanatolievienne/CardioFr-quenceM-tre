@@ -5,38 +5,37 @@
 #include <RtcDS1302.h>
 
 // =============================================================================
-// 1. CONFIGURATION MATÉRIELLE DES BROCHES
+// 1. CONFIGURATION MATÉRIELLE
 // =============================================================================
-// FS1 : Capteur PPG
 const byte PIN_PPG = A0;
 
-// FS2 : RTC DS1302
-const int RST_PIN = 2; // CE
-const int DAT_PIN = 3; // IO
-const int CLK_PIN = 4; // SCLK
+// RTC DS1302 (D2, D3, D4)
+const int RST_PIN = 2;
+const int DAT_PIN = 3;
+const int CLK_PIN = 4;
 ThreeWire monFil(DAT_PIN, CLK_PIN, RST_PIN);
 RtcDS1302<ThreeWire> Rtc(monFil);
 
-// FS3 : LED RGB (Cathode commune au GND)
-const byte PIN_LED_BLEU  = 6; // D6
-const byte PIN_LED_VERT  = 7; // D7
-const byte PIN_LED_ROUGE = 8; // D8
+// LED RGB
+const byte PIN_LED_BLEU  = 6;
+const byte PIN_LED_VERT  = 7;
+const byte PIN_LED_ROUGE = 8;
 
-// FS4 : Buzzer piézo & Bouton Mute
-const byte PIN_BUZZER      = 5; // D5
-const byte PIN_BOUTON_MUTE = 9; // D9 (câblé vers GND)
+// Buzzer & Bouton Mute
+const byte PIN_BUZZER      = 5;
+const byte PIN_BOUTON_MUTE = 9;
 
-// FS5 & FS6 : Encodeur rotatif EC11
-const byte PIN_ENC_A  = 10; // D10 (PB2)
-const byte PIN_ENC_B  = 12; // D12 (PB4)
-const byte PIN_ENC_SW = 11; // D11 (Axe poussoir vers GND)
+// Encodeur EC11
+const byte PIN_ENC_A  = 10;
+const byte PIN_ENC_B  = 12;
+const byte PIN_ENC_SW = 11;
 
-// FS5 : Double écran OLED Software I2C
+// Écrans OLED (Software I2C)
 U8G2_SSD1306_128X64_NONAME_1_SW_I2C ecran1(U8G2_R0, /* clock=*/ A4, /* data=*/ A3, /* reset=*/ U8X8_PIN_NONE);
 U8G2_SSD1306_128X64_NONAME_1_SW_I2C ecran2(U8G2_R0, /* clock=*/ A2, /* data=*/ A1, /* reset=*/ U8X8_PIN_NONE);
 
 // =============================================================================
-// 2. PARAMÈTRES ET STRUCTURES EEPROM (FS6)
+// 2. STRUCTURE EEPROM (FS6)
 // =============================================================================
 #define ADRESSE_MAGIC       0    
 #define ADRESSE_NB_MESURES  2    
@@ -49,7 +48,7 @@ struct MesureEEPROM {
   uint8_t bpm;
   uint8_t jour;
   uint8_t mois;
-  uint8_t annee; // offset par rapport à 2000
+  uint8_t annee;
   uint8_t heure;
   uint8_t minute;
   uint8_t seconde;
@@ -63,43 +62,37 @@ ModeEcran modeActuel = MODE_NORMAL;
 
 int indexHistorique = 0;
 uint8_t nbMesuresStockees = 0;
-byte optionSelectionnee = 0; // 0 = Langue, 1 = Effacer
+byte optionSelectionnee = 0;
 
-// Moyenne de 10 points (ET6.2)
 bool acquisitionEnCours = false;
 uint8_t compteurEchantillons = 0;
 uint16_t sommeBpm = 0;
 unsigned long dernierEchantillonMoyenne = 0;
 
-// Seuils d'appui sur l'axe encodeur (D11)
-const unsigned long SEUIL_APPUI_COURT_MS = 2000;
-const unsigned long SEUIL_APPUI_LONG_MS  = 6000;
+const unsigned long SEUIL_APPUI_COURT_MS = 1500;
+const unsigned long SEUIL_APPUI_LONG_MS  = 5000;
 bool boutonEstEnfonce = false;
 unsigned long tempsDebutEnfonce = 0;
 unsigned long dureeAppuiCourante = 0;
 
 // =============================================================================
-// 3. PARAMÈTRES FS1 (TRAITEMENT DU SIGNAL PPG RÉEL WPSE340)
+// 3. PARAMÈTRES TRAITEMENT PPG (FS1)
 // =============================================================================
 const unsigned long PERIODE_ECH_MS = 10; // 100 Hz
-const float ALPHA_LISSE = 0.15f;  // Filtrage passe-bas réactif
-const float ALPHA_BASE  = 0.003f; // Suivi de composante continue (DC)
-const float ALPHA_DECAY = 0.995f; // Décroissance d'enveloppe plus souple
-
-float signalLisse = 0.0f;
-float ligneBase   = 0.0f;
-float creteMax    = 8.0f;
+float signalLisse = 512.0f;
+float ligneBase   = 512.0f;
+float creteMax    = 40.0f;
 bool ppgInitialise = false;
 unsigned long derniereLecturePPG = 0;
 
-// Seuils adaptés à l'amplitude réelle du capteur
-const float SEUIL_HAUT = 0.50f; // Déclenchement au passage du pic systolique
-const float SEUIL_BAS  = 0.25f; // Réarmement diastolique
-const unsigned long TEMPS_REFRACTAIRE_MS = 400; // Période réfractaire (~155 BPM max)
+// Automate de détection des pics systoliques
+const float SEUIL_HAUT = 0.58f;
+const float SEUIL_BAS  = 0.38f;
+const unsigned long TEMPS_REFRACTAIRE_MS = 320; // Autorise jusqu'à 185 BPM
 bool enPic = false;
 unsigned long tempsDernierBattement = 0;
 
-const byte TAILLE_BUFF_BPM = 5;
+const byte TAILLE_BUFF_BPM = 4;
 float buffBpm[TAILLE_BUFF_BPM] = {0};
 byte indexBuffBpm = 0;
 float bpmFinal = 0.0f;
@@ -107,7 +100,7 @@ bool doigtPresent = false;
 float signalNorm = 0.0f;
 
 // =============================================================================
-// 4. PARAMÈTRES FS3 (LED RGB) & FS4 (BUZZER)
+// 4. ACTIONNEURS : LED RGB (FS3) & BUZZER (FS4)
 // =============================================================================
 const float SEUIL_BRADYCARDIE = 60.0f;
 const float SEUIL_TACHYCARDIE = 100.0f;
@@ -120,16 +113,13 @@ EtatSante etatSanteCourant = SANTE_ETEINT;
 const unsigned int FREQ_GRAVE   = 440;
 const unsigned int FREQ_MODEREE = 880;
 const unsigned int FREQ_AIGUE   = 1760;
-const unsigned long DUREE_BIP_MS = 40;
 
-unsigned long debutBip = 0;
-bool sonEnCours = false;
 bool sonActive = true;
 bool dernierEtatMute = HIGH;
 unsigned long dernierDebounceMute = 0;
 
 // =============================================================================
-// 5. PARAMÈTRES FS5 (OSCILLOSCOPE & AFFICHAGE)
+// 5. OSCILLOSCOPE (FS5)
 // =============================================================================
 const byte LARGEUR_TRACE = 88;
 const byte HAUTEUR_TRACE = 36;
@@ -147,16 +137,15 @@ unsigned long dernierAffichagePPG = 0;
 unsigned long dernierAffichageHeure = 0;
 char strHeure[9] = "00:00:00";
 
-// Interruption Encodeur
 volatile int deltaEncodeur = 0;
 volatile unsigned long dernierTempsInterruption = 0;
 
 ISR(PCINT0_vect) {
-  uint8_t etatA = (PINB & (1 << PINB2)) ? HIGH : LOW; // D10
-  uint8_t etatB = (PINB & (1 << PINB4)) ? HIGH : LOW; // D12
+  uint8_t etatA = (PINB & (1 << PINB2)) ? HIGH : LOW;
+  uint8_t etatB = (PINB & (1 << PINB4)) ? HIGH : LOW;
 
   unsigned long maintenant = millis();
-  if (etatA == LOW && (maintenant - dernierTempsInterruption > 40)) {
+  if (etatA == LOW && (maintenant - dernierTempsInterruption > 35)) {
     dernierTempsInterruption = maintenant;
     if (etatB == HIGH) {
       deltaEncodeur++;
@@ -169,7 +158,7 @@ ISR(PCINT0_vect) {
 }
 
 // =============================================================================
-// 6. GESTION EEPROM (FS6)
+// 6. GESTION EEPROM
 // =============================================================================
 void initialiserEEPROM() {
   uint16_t magic;
@@ -227,7 +216,7 @@ MesureEEPROM lireMesure(uint8_t index) {
 }
 
 // =============================================================================
-// 7. GESTION ACTIONNEURS : LED RGB (FS3) & BUZZER (FS4)
+// 7. PILOTAGE DES ACTIONNEURS
 // =============================================================================
 void actualiserEtatSante() {
   if (!doigtPresent || bpmFinal < BPM_MIN_VALIDE || bpmFinal > BPM_MAX_VALIDE) {
@@ -265,13 +254,14 @@ void piloterLedRGB() {
       digitalWrite(PIN_LED_BLEU, LOW);
       digitalWrite(PIN_LED_ROUGE, HIGH);
       // Hachage logiciel du vert pour compenser la sensibilité lumineuse
-      static byte cptHachage = 0;
-      cptHachage = (cptHachage + 1) % 4;
-      digitalWrite(PIN_LED_VERT, (cptHachage == 0) ? HIGH : LOW);
+      static byte cpt = 0;
+      cpt = (cpt + 1) % 4;
+      digitalWrite(PIN_LED_VERT, (cpt == 0) ? HIGH : LOW);
       break;
   }
 }
 
+// Émission sonore non bloquante avec coupure matérielle automatique
 void declencherBip(float bpm) {
   if (!sonActive || !doigtPresent || bpm < BPM_MIN_VALIDE || bpm > BPM_MAX_VALIDE) {
     return;
@@ -284,31 +274,22 @@ void declencherBip(float bpm) {
     freq = FREQ_AIGUE;
   }
 
-  tone(PIN_BUZZER, freq);
-  debutBip = millis();
-  sonEnCours = true;
-}
-
-void gererFinBip() {
-  if (sonEnCours && (millis() - debutBip >= DUREE_BIP_MS)) {
-    noTone(PIN_BUZZER);
-    sonEnCours = false;
-  }
+  // tone(pin, freq, duration) utilise le Timer 2 : coupure automatique à 35 ms
+  tone(PIN_BUZZER, freq, 35);
 }
 
 // =============================================================================
-// 8. FONCTIONS GRAPHIQUES (ÉCRAN 1 & ÉCRAN 2)
+// 8. DESSIN DES ÉCRANS
 // =============================================================================
 void dessinerEcran1() {
   ecran1.firstPage();
   do {
-    // 1. Retour visuel pendant la jauge d'appui sur l'encodeur
     if (boutonEstEnfonce) {
       ecran1.setFont(u8g2_font_6x10_tf);
-      ecran1.drawStr(14, 18, (langueActive == FR) ? "APPUI EN COURS..." : "HOLDING BUTTON...");
+      ecran1.drawStr(14, 18, (langueActive == FR) ? "APPUI EN COURS..." : "HOLDING...");
 
       char strSec[15];
-      snprintf(strSec, sizeof(strSec), "%lu s / 6s", dureeAppuiCourante / 1000);
+      snprintf(strSec, sizeof(strSec), "%lu s / 5s", dureeAppuiCourante / 1000);
       ecran1.drawStr(36, 34, strSec);
 
       ecran1.drawFrame(14, 42, 100, 8);
@@ -317,14 +298,13 @@ void dessinerEcran1() {
 
       ecran1.setFont(u8g2_font_4x6_tf);
       if (dureeAppuiCourante >= SEUIL_APPUI_LONG_MS) {
-        ecran1.drawStr(18, 58, (langueActive == FR) ? "RELACHER POUR SAUVER !" : "RELEASE TO SAVE !");
+        ecran1.drawStr(18, 58, (langueActive == FR) ? "RELACHER POUR SAUVER" : "RELEASE TO SAVE");
       } else if (dureeAppuiCourante >= SEUIL_APPUI_COURT_MS) {
         ecran1.drawStr(22, 58, (langueActive == FR) ? "Relacher pour Menu" : "Release for Menu");
       }
       continue;
     }
 
-    // 2. Mode Normal : Heure et Fréquence cardiaque
     if (modeActuel == MODE_NORMAL) {
       ecran1.setFont(u8g2_font_helvB14_tf);
       ecran1.drawStr(22, 22, strHeure);
@@ -350,10 +330,9 @@ void dessinerEcran1() {
           ecran1.drawStr(98, 48, "bpm");
         }
         ecran1.setFont(u8g2_font_4x6_tf);
-        ecran1.drawStr(12, 60, (langueActive == FR) ? "3s=Menu  6s=Sauver" : "3s=Menu  6s=Save");
+        ecran1.drawStr(12, 60, (langueActive == FR) ? "2s=Menu  5s=Sauver" : "2s=Menu  5s=Save");
       }
     } 
-    // 3. Mode Historique EEPROM
     else if (modeActuel == MODE_HISTORIQUE) {
       ecran1.setFont(u8g2_font_6x10_tf);
       ecran1.drawStr(4, 10, (langueActive == FR) ? "HISTORIQUE" : "HISTORY");
@@ -380,9 +359,8 @@ void dessinerEcran1() {
       }
 
       ecran1.setFont(u8g2_font_4x6_tf);
-      ecran1.drawStr(4, 60, (langueActive == FR) ? "Rot=Defiler  3s=Options" : "Rot=Scroll  3s=Options");
+      ecran1.drawStr(4, 60, (langueActive == FR) ? "Rot=Defiler  2s=Options" : "Rot=Scroll  2s=Options");
     }
-    // 4. Mode Options
     else if (modeActuel == MODE_OPTIONS) {
       ecran1.setFont(u8g2_font_6x10_tf);
       ecran1.drawStr(4, 10, "OPTIONS");
@@ -395,7 +373,7 @@ void dessinerEcran1() {
       ecran1.drawStr(12, 42, (langueActive == FR) ? "Effacer historique" : "Clear memory");
 
       ecran1.setFont(u8g2_font_4x6_tf);
-      ecran1.drawStr(4, 58, (langueActive == FR) ? "Rot=Choix  6s=Valider  3s=Retour" : "Rot=Pick  6s=Select  3s=Back");
+      ecran1.drawStr(4, 58, (langueActive == FR) ? "Rot=Choix  5s=Valider  2s=Retour" : "Rot=Pick  5s=Select  2s=Back");
     }
   } while (ecran1.nextPage());
 }
@@ -403,12 +381,11 @@ void dessinerEcran1() {
 void dessinerEcran2() {
   ecran2.firstPage();
   do {
-    // En-tête
     ecran2.setFont(u8g2_font_6x10_tf);
     ecran2.drawStr(4, 10, "PPG");
     ecran2.drawStr(78, 10, NOMS_ECHELLES[indexEchelle]);
 
-    // Axes
+    // Axes orthogonaux
     ecran2.drawVLine(18, 16, 39);
     ecran2.drawHLine(18, Y_BASE, LARGEUR_TRACE);
 
@@ -426,7 +403,7 @@ void dessinerEcran2() {
     ecran2.drawVLine(18 + 58, Y_BASE, 3);
     ecran2.drawVLine(18 + 87, Y_BASE, 3);
 
-    // Tracé de l'onde PPG réelle
+    // Tracé de la courbe
     for (byte i = 0; i < LARGEUR_TRACE - 1; i++) {
       byte idx1 = (indexTrace + i) % LARGEUR_TRACE;
       byte idx2 = (indexTrace + i + 1) % LARGEUR_TRACE;
@@ -440,12 +417,11 @@ void dessinerEcran2() {
 }
 
 // =============================================================================
-// 9. INITIALISATION (SETUP)
+// 9. SETUP
 // =============================================================================
 void setup() {
   Serial.begin(115200);
 
-  // Configuration I/O
   pinMode(PIN_PPG, INPUT);
 
   pinMode(PIN_LED_ROUGE, OUTPUT);
@@ -459,143 +435,155 @@ void setup() {
   pinMode(PIN_ENC_B, INPUT_PULLUP);
   pinMode(PIN_ENC_SW, INPUT_PULLUP);
 
-  // Interruption PCINT pour Encodeur sur D10 et D12
+  // PCINT sur D10 et D12
   cli();
   PCICR |= (1 << PCIE0);
   PCMSK0 |= (1 << PCINT2) | (1 << PCINT4);
   sei();
 
-  // Initialisation RTC DS1302
   Rtc.Begin();
   if (Rtc.GetIsWriteProtected()) Rtc.SetIsWriteProtected(false);
   if (!Rtc.GetIsRunning()) Rtc.SetIsRunning(true);
 
-  // Initialisation OLEDs
   ecran1.begin();
   ecran2.begin();
 
-  // Initialisation EEPROM
   initialiserEEPROM();
 
   for (byte i = 0; i < LARGEUR_TRACE; i++) {
     bufferPPG[i] = 0;
   }
 
-  Serial.println(F("=== SYSTEME CARDIO INTEGRE OPERATIONNEL ==="));
+  Serial.println(F("=== SYSTEME STABILISE ==="));
 }
 
 // =============================================================================
-// 10. BOUCLE PRINCIPALE NON-BLOQUANTE (LOOP)
+// 10. LOOP
 // =============================================================================
 void loop() {
   unsigned long maintenant = millis();
 
   // ---------------------------------------------------------------------------
-  // A. FS1 : TRAITEMENT DU SIGNAL PPG (Version exacte et robuste FS1)
+  // A. TRAITEMENT DU SIGNAL PPG (Cadencé à 100 Hz / 10 ms)
   // ---------------------------------------------------------------------------
   if (maintenant - derniereLecturePPG >= PERIODE_ECH_MS) {
     derniereLecturePPG = maintenant;
 
     int brut = analogRead(PIN_PPG);
-    if (!ppgInitialise) {
-      signalLisse = brut;
-      ligneBase   = brut;
-      ppgInitialise = true;
-    }
 
-    // Filtrage récursif conforme FS1
-    signalLisse += ALPHA_LISSE * (brut - signalLisse);
-    ligneBase   += ALPHA_BASE * (signalLisse - ligneBase);
-    float ac = signalLisse - ligneBase;
+    // Détection contact : brut > 200 confirme la présence du doigt sur le capteur
+    bool nouveauContact = (brut > 200 && brut < 980);
 
-    // Plage de détection élargie pour ne pas rejeter le doigt
-    doigtPresent = (brut > 30 && brut < 1010);
-
-    // Suivi d'enveloppe crête
-    if (ac > creteMax) {
-      creteMax = ac;
-    } else {
-      creteMax *= ALPHA_DECAY;
-      if (creteMax < 5.0f) creteMax = 5.0f;
-    }
-
-    // Normalisation continue [0.0 ; 1.0] pour l'oscilloscope
-    if (ac > 0.0f) {
-      signalNorm = ac / creteMax;
-      if (signalNorm > 1.0f) signalNorm = 1.0f;
-    } else {
+    if (!nouveauContact) {
+      doigtPresent = false;
+      bpmFinal = 0.0f;
       signalNorm = 0.0f;
-    }
+      enPic = false;
+      // Remise à zéro immédiate du buffer BPM pour éviter de garder l'ancienne valeur
+      for (byte b = 0; b < TAILLE_BUFF_BPM; b++) buffBpm[b] = 0;
+      actualiserEtatSante();
+    } else {
+      doigtPresent = true;
 
-    // Détection des battements cardiaques
-    if (!enPic) {
-      if (signalNorm > SEUIL_HAUT && (maintenant - tempsDernierBattement > TEMPS_REFRACTAIRE_MS) && doigtPresent) {
-        enPic = true;
-        unsigned long deltaT = maintenant - tempsDernierBattement;
-        tempsDernierBattement = maintenant;
+      if (!ppgInitialise) {
+        signalLisse = brut;
+        ligneBase   = brut;
+        ppgInitialise = true;
+      }
 
-        if (deltaT >= TEMPS_REFRACTAIRE_MS && deltaT <= 1600) {
-          float bpmInst = 60000.0f / (float)deltaT;
-          bool valide = true;
-          if (bpmFinal > 35.0f) {
-            float ecart = abs(bpmInst - bpmFinal);
-            if (ecart > (bpmFinal * 0.35f)) valide = false;
-          }
+      // Filtrage passe-bas et suivi de composante continue
+      signalLisse += 0.25f * (brut - signalLisse);
+      ligneBase   += 0.025f * (signalLisse - ligneBase);
+      float ac = signalLisse - ligneBase;
 
-          if (valide) {
-            buffBpm[indexBuffBpm] = bpmInst;
-            indexBuffBpm = (indexBuffBpm + 1) % TAILLE_BUFF_BPM;
-            float somme = 0;
-            byte compte = 0;
-            for (byte i = 0; i < TAILLE_BUFF_BPM; i++) {
-              if (buffBpm[i] > 0) {
-                somme += buffBpm[i];
-                compte++;
-              }
+      // Suivi d'amplitude crête
+      if (abs(ac) > creteMax) {
+        creteMax = abs(ac);
+      } else {
+        creteMax *= 0.992f;
+        if (creteMax < 25.0f) creteMax = 25.0f;
+      }
+
+      // Normalisation symétrique centrée autour de 0.5
+      signalNorm = 0.5f + (ac / (2.0f * creteMax));
+      if (signalNorm > 1.0f) signalNorm = 1.0f;
+      if (signalNorm < 0.0f) signalNorm = 0.0f;
+
+      // Détection de pic par trigger de Schmitt
+      if (!enPic) {
+        if (signalNorm > SEUIL_HAUT && (maintenant - tempsDernierBattement > TEMPS_REFRACTAIRE_MS)) {
+          enPic = true;
+          unsigned long deltaT = maintenant - tempsDernierBattement;
+          tempsDernierBattement = maintenant;
+
+          // Plage physiologique valide : 320 ms à 1700 ms (~35 à 185 BPM)
+          if (deltaT >= TEMPS_REFRACTAIRE_MS && deltaT <= 1700) {
+            float bpmInst = 60000.0f / (float)deltaT;
+            
+            // Rejet des artefacts sévères si un rythme est déjà établi
+            bool valide = true;
+            if (bpmFinal > 35.0f) {
+              float diff = abs(bpmInst - bpmFinal);
+              if (diff > (bpmFinal * 0.40f)) valide = false;
             }
-            if (compte > 0) bpmFinal = somme / compte;
 
-            // Bip sonore synchronisé
-            declencherBip(bpmFinal);
+            if (valide) {
+              buffBpm[indexBuffBpm] = bpmInst;
+              indexBuffBpm = (indexBuffBpm + 1) % TAILLE_BUFF_BPM;
+
+              float somme = 0;
+              byte compte = 0;
+              for (byte i = 0; i < TAILLE_BUFF_BPM; i++) {
+                if (buffBpm[i] > 0) {
+                  somme += buffBpm[i];
+                  compte++;
+                }
+              }
+              if (compte > 0) bpmFinal = somme / compte;
+
+              // Déclenchement du bip sonore au tempo réel
+              declencherBip(bpmFinal);
+            }
           }
         }
+      } else {
+        // Réarmement dès redescente
+        if (signalNorm < SEUIL_BAS) {
+          enPic = false;
+        }
       }
-    } else {
-      if (signalNorm < SEUIL_BAS) {
-        enPic = false; // Réarmement
-      }
+
+      actualiserEtatSante();
     }
 
-    if (!doigtPresent) {
-      bpmFinal = 0.0f;
+    // Mise en tampon oscilloscope
+    unsigned int dt = ECHELLES_MS[indexEchelle];
+    if (maintenant - dernierTempsTrace >= dt) {
+      dernierTempsTrace = maintenant;
+      uint8_t pixelH = (uint8_t)(signalNorm * (HAUTEUR_TRACE - 2));
+      bufferPPG[indexTrace] = pixelH;
+      indexTrace = (indexTrace + 1) % LARGEUR_TRACE;
     }
-
-    // Mise à jour voyant LED d'état de santé
-    actualiserEtatSante();
   }
 
   // ---------------------------------------------------------------------------
-  // B. FS3 & FS4 : PILOTAGE PHYSIQUE DES ACTIONNEURS
+  // B. ACTIONNEURS : LED RGB
   // ---------------------------------------------------------------------------
   piloterLedRGB();
-  gererFinBip();
 
   // Bouton Mute FS4 (D9)
   bool lectureMute = digitalRead(PIN_BOUTON_MUTE);
   if (lectureMute != dernierEtatMute && (maintenant - dernierDebounceMute > 50)) {
     if (lectureMute == LOW) {
       sonActive = !sonActive;
-      if (!sonActive) {
-        noTone(PIN_BUZZER);
-        sonEnCours = false;
-      }
+      if (!sonActive) noTone(PIN_BUZZER);
     }
     dernierDebounceMute = maintenant;
   }
   dernierEtatMute = lectureMute;
 
   // ---------------------------------------------------------------------------
-  // C. FS5 & FS6 : GESTION DE L'ENCODEUR ROTATIF (AXE ET ROTATION)
+  // C. ENCODEUR ET MENU (FS6)
   // ---------------------------------------------------------------------------
   if (deltaEncodeur != 0) {
     if (modeActuel == MODE_HISTORIQUE && nbMesuresStockees > 0) {
@@ -608,7 +596,6 @@ void loop() {
     deltaEncodeur = 0;
   }
 
-  // Lecture continue de l'axe poussoir de l'encodeur (D11)
   bool lectureSW = digitalRead(PIN_ENC_SW);
   if (lectureSW == LOW) {
     if (!boutonEstEnfonce) {
@@ -623,7 +610,6 @@ void loop() {
       dureeAppuiCourante = 0;
 
       if (dureeTotale >= SEUIL_APPUI_LONG_MS) {
-        // Appui long (>= 6s)
         if (modeActuel == MODE_NORMAL && !acquisitionEnCours) {
           acquisitionEnCours = true;
           compteurEchantillons = 0;
@@ -637,24 +623,17 @@ void loop() {
           }
         }
       } else if (dureeTotale >= SEUIL_APPUI_COURT_MS) {
-        // Appui court (2s à 6s)
-        if (modeActuel == MODE_NORMAL) {
-          modeActuel = MODE_HISTORIQUE;
-        } else if (modeActuel == MODE_HISTORIQUE) {
-          modeActuel = MODE_OPTIONS;
-        } else {
-          modeActuel = MODE_NORMAL;
-        }
+        if (modeActuel == MODE_NORMAL) modeActuel = MODE_HISTORIQUE;
+        else if (modeActuel == MODE_HISTORIQUE) modeActuel = MODE_OPTIONS;
+        else modeActuel = MODE_NORMAL;
       }
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // D. FS6 : CALCUL DE LA MOYENNE SUR 10 POINTS ET STOCKAGE
-  // ---------------------------------------------------------------------------
-  if (acquisitionEnCours && (maintenant - dernierEchantillonMoyenne >= 140)) {
+  // Calcul moyenne sur 10 points
+  if (acquisitionEnCours && (maintenant - dernierEchantillonMoyenne >= 150)) {
     dernierEchantillonMoyenne = maintenant;
-    int bpmInst = (bpmFinal > 0) ? (int)(bpmFinal + 0.5f) : 70;
+    int bpmInst = (bpmFinal > 0) ? (int)(bpmFinal + 0.5f) : 72;
     sommeBpm += bpmInst;
     compteurEchantillons++;
 
@@ -667,36 +646,19 @@ void loop() {
   }
 
   // ---------------------------------------------------------------------------
-  // E. FS5 : ACQUISITION DE L'OSCILLOSCOPE SELON LA BASE DE TEMPS
+  // D. RAFRAÎCHISSEMENT SÉPARÉ DES ÉCRANS
   // ---------------------------------------------------------------------------
-  unsigned int dt = ECHELLES_MS[indexEchelle];
-  while (maintenant - dernierTempsTrace >= dt) {
-    dernierTempsTrace += dt;
-    // Injection du signal PPG normalisé réel de FS1
-    uint8_t pixelH = (uint8_t)(signalNorm * (HAUTEUR_TRACE - 2));
-    bufferPPG[indexTrace] = pixelH;
-    indexTrace = (indexTrace + 1) % LARGEUR_TRACE;
-  }
-
-  // ---------------------------------------------------------------------------
-  // F. RAFRAÎCHISSEMENT DES DEUX ÉCRANS OLED
-  // ---------------------------------------------------------------------------
- // Écran 1 (Heure & BPM) : rafraîchi toutes les 500 ms (suffisant pour les secondes)
-  if (maintenant - dernierAffichageHeure >= 500) {
+  // Écran 1 : mis à jour toutes les secondes (ou 100 ms si un appui est en cours)
+  unsigned long intervalleEcran1 = (boutonEstEnfonce || acquisitionEnCours) ? 100 : 1000;
+  if (maintenant - dernierAffichageHeure >= intervalleEcran1) {
     dernierAffichageHeure = maintenant;
     RtcDateTime dtRTC = Rtc.GetDateTime();
     snprintf(strHeure, sizeof(strHeure), "%02d:%02d:%02d", dtRTC.Hour(), dtRTC.Minute(), dtRTC.Second());
     dessinerEcran1();
   }
 
-  // Écran 2 (Oscilloscope PPG) : rafraîchi toutes les 90 ms (~11 FPS, libère du temps CPU)
-  if (maintenant - dernierAffichagePPG >= 90) {
-    dernierAffichagePPG = maintenant;
-    dessinerEcran2();
-  }
-
-  // Écran 2 (Oscilloscope PPG) : rafraîchi à ~15 FPS
-  if (maintenant - dernierAffichagePPG >= 65) {
+  // Écran 2 (Oscilloscope PPG) : rafraîchi à cadence fluide
+  if (maintenant - dernierAffichagePPG >= 75) {
     dernierAffichagePPG = maintenant;
     dessinerEcran2();
   }
