@@ -1,144 +1,137 @@
 #include <Arduino.h>
 
-const int CAPTEUR_PPG = A0;
+// --- Configuration matérielle ---
+const byte PIN_PPG = A0;
+const unsigned long PERIODE_ECH_MS = 10; // 100 Hz
 
-// Fréquence d'échantillonnage
-const unsigned long PERIODE_ECHANTILLON = 10000; // 10 ms = 100 Hz
+// --- Paramètres de filtrage ---
+const float ALPHA_LISSE = 0.10f;  // Filtrage passe-bas légèrement renforcé
+const float ALPHA_BASE  = 0.002f; // Ligne de base lente
+const float ALPHA_DECAY = 0.998f; // Maintien d'enveloppe plus stable
 
-// Variables de traitement
-float baseline = 0;
-float signalFiltre = 0;
-float amplitude = 20;
+// --- Variables de filtrage ---
+float signalLisse = 0.0f;
+float ligneBase   = 0.0f;
+float creteMax    = 15.0f;
+bool initialise   = false;
+unsigned long derniereLecture = 0;
 
-// Détection des pics
-float signalPrecedent = 0;
-float signalAvant = 0;
+// --- Détection par Hystérésis & Période réfractaire ---
+const float SEUIL_HAUT = 0.60f; // Déclenchement franc
+const float SEUIL_BAS  = 0.30f; // Réarmement
+const unsigned long TEMPS_REFRACTAIRE_MS = 450; // Bloque l'onde dicrote (max 133 BPM)
 
-unsigned long dernierBattement = 0;
-float bpm = 0;
+bool enPic = false;
+unsigned long tempsDernierBattement = 0;
 
-// Temps minimum entre deux battements
-const unsigned long REFRACTAIRE = 300000; // 300 ms
+// --- Calcul et stabilisation du BPM ---
+const byte TAILLE_BUFF = 5;
+float buffBpm[TAILLE_BUFF] = {0};
+byte indexBuff = 0;
+float bpmFinal = 0.0f;
 
 void setup() {
-
-    Serial.begin(115200);
-
-    // Première mesure pour initialiser la moyenne
-    int mesure = analogRead(CAPTEUR_PPG);
-    baseline = mesure;
-
-    Serial.println("PPG START");
+  Serial.begin(115200);
 }
 
 void loop() {
+  unsigned long maintenant = millis();
 
-    static unsigned long dernierEchantillon = 0;
+  if (maintenant - derniereLecture < PERIODE_ECH_MS) {
+    return;
+  }
+  derniereLecture = maintenant;
 
-    unsigned long maintenant = micros();
+  int brut = analogRead(PIN_PPG);
 
-    // Echantillonnage à 100 Hz
-    if (maintenant - dernierEchantillon >= PERIODE_ECHANTILLON) {
+  if (!initialise) {
+    signalLisse = brut;
+    ligneBase   = brut;
+    initialise  = true;
+  }
 
-        dernierEchantillon = maintenant;
+  // 1. Filtrage passe-bas et ligne de base
+  signalLisse += ALPHA_LISSE * (brut - signalLisse);
+  ligneBase   += ALPHA_BASE * (signalLisse - ligneBase);
+  float ac = signalLisse - ligneBase;
 
-        // ------------------------------------------------
-        // 1. Lecture du capteur
-        // ------------------------------------------------
+  // 2. Détection présence du doigt (plage ADC typique WPSE340)
+  bool doigtPresent = (brut > 100 && brut < 950);
 
-        int mesure = analogRead(CAPTEUR_PPG);
+  // 3. Suivi d'enveloppe crête
+  if (ac > creteMax) {
+    creteMax = ac;
+  } else {
+    creteMax *= ALPHA_DECAY;
+    if (creteMax < 12.0f) creteMax = 12.0f;
+  }
 
+  // 4. Normalisation
+  float norm = 0.0f;
+  if (ac > 0.0f) {
+    norm = ac / creteMax;
+    if (norm > 1.0f) norm = 1.0f;
+  }
 
-        // ------------------------------------------------
-        // 2. Suppression de la composante continue
-        // ------------------------------------------------
-        // On estime lentement la valeur moyenne du signal.
+  // 5. Machine à états
+  bool battementDetecte = false;
 
-        baseline = 0.99 * baseline + 0.01 * mesure;
+  if (!enPic) {
+    if (norm > SEUIL_HAUT && (maintenant - tempsDernierBattement > TEMPS_REFRACTAIRE_MS) && doigtPresent) {
+      enPic = true;
+      battementDetecte = true;
 
-        float signal = mesure - baseline;
+      unsigned long deltaT = maintenant - tempsDernierBattement;
+      tempsDernierBattement = maintenant;
 
+      // Intervalle physiologique valide (450 ms à 1600 ms -> ~37 à 133 BPM)
+      if (deltaT >= TEMPS_REFRACTAIRE_MS && deltaT <= 1600) {
+        float bpmInst = 60000.0f / (float)deltaT;
 
-        // ------------------------------------------------
-        // 3. Filtrage léger
-        // ------------------------------------------------
+        // Rejet des sauts brutaux si on a déjà une estimation stable
+        bool valide = true;
+        if (bpmFinal > 40.0f) {
+          float ecart = abs(bpmInst - bpmFinal);
+          if (ecart > (bpmFinal * 0.30f)) { 
+            valide = false; // Variation > 30% rejetée (parasite)
+          }
+        }
 
-        signalFiltre = 0.7 * signalFiltre + 0.3 * signal;
+        if (valide) {
+          buffBpm[indexBuff] = bpmInst;
+          indexBuff = (indexBuff + 1) % TAILLE_BUFF;
 
-
-        // ------------------------------------------------
-        // 4. Estimation de l'amplitude du signal
-        // ------------------------------------------------
-
-        amplitude = 0.995 * amplitude + 0.005 * abs(signalFiltre);
-
-        float seuil = amplitude * 1.5;
-
-
-        // ------------------------------------------------
-        // 5. Détection d'un pic
-        // ------------------------------------------------
-
-        bool pic = false;
-
-        if (signalAvant < signalPrecedent &&
-            signalPrecedent > signalFiltre &&
-            signalPrecedent > seuil) {
-
-            unsigned long tempsPic = maintenant - 10000;
-
-            if (tempsPic - dernierBattement > REFRACTAIRE) {
-
-                pic = true;
-
-                // ----------------------------------------
-                // 6. Calcul de la fréquence cardiaque
-                // ----------------------------------------
-
-                if (dernierBattement != 0) {
-
-                    unsigned long periode =
-                        tempsPic - dernierBattement;
-
-                    bpm = 60000000.0 / periode;
-
-                    // Sécurité : fréquence physiologiquement
-                    // plausible pour notre test
-                    if (bpm < 30 || bpm > 220) {
-                        bpm = 0;
-                    }
-                }
-
-                dernierBattement = tempsPic;
+          float somme = 0;
+          byte compte = 0;
+          for (byte i = 0; i < TAILLE_BUFF; i++) {
+            if (buffBpm[i] > 0) {
+              somme += buffBpm[i];
+              compte++;
             }
+          }
+          if (compte > 0) {
+            bpmFinal = somme / compte;
+          }
         }
-
-
-        // Mise à jour des anciennes valeurs
-        signalAvant = signalPrecedent;
-        signalPrecedent = signalFiltre;
-
-
-        // ------------------------------------------------
-        // 7. Affichage pour Serial Plotter
-        // ------------------------------------------------
-
-        Serial.print(signalFiltre);
-        Serial.print("\t");
-
-        Serial.print(seuil);
-        Serial.print("\t");
-
-        // marqueur visuel lorsqu'un battement est détecté
-        if (pic) {
-            Serial.print(seuil * 2);
-        }
-        else {
-            Serial.print(0);
-        }
-
-        Serial.print("\t");
-
-        Serial.println(bpm);
+      }
     }
+  } else {
+    if (norm < SEUIL_BAS) {
+      enPic = false; // Réarmé
+    }
+  }
+
+  if (!doigtPresent) {
+    bpmFinal = 0.0f;
+  }
+
+  // --- Télémétrie Teleplot ---
+  Serial.print(">Norm:");
+  Serial.println(norm, 2);
+
+  Serial.print(">BPM:");
+  Serial.println(bpmFinal, 1);
+
+  Serial.print(">Pulse:");
+  Serial.println(battementDetecte ? 1 : 0);
 }
