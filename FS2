@@ -1,73 +1,103 @@
 #include <Arduino.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <Ds1302.h>
+#include <U8g2lib.h>
+#include <ThreeWire.h>
+#include <RtcDS1302.h>
 
-#define LARGEUR_ECRAN 128
-#define HAUTEUR_ECRAN 64
+// --- Configuration DS1302 ---
+const int RST_PIN = 2; // D2 (CE)
+const int DAT_PIN = 3; // D3 (IO)
+const int CLK_PIN = 4; // D4 (SCLK)
 
-const int RST_PIN = 8;
-const int DAT_PIN = 7;
-const int CLK_PIN = 6;
+ThreeWire monFil(DAT_PIN, CLK_PIN, RST_PIN);
+RtcDS1302<ThreeWire> Rtc(monFil);
 
-// Constructeur de cette bibliothèque : (ena/RST, clk, dat)
-Ds1302 myRTC(RST_PIN, CLK_PIN, DAT_PIN);
+// --- Configuration OLED 1 via Software I2C sur tes broches réelles ---
+// U8G2_SSD1306_128X64_NONAME_1_SW_I2C(rotation, clock, data, reset)
+// SCL sur A4, SDA sur A3
+U8G2_SSD1306_128X64_NONAME_1_SW_I2C u8g2(U8G2_R0, /* clock=*/ A4, /* data=*/ A3, /* reset=*/ U8X8_PIN_NONE);
 
-Adafruit_SSD1306 ecran(LARGEUR_ECRAN, HAUTEUR_ECRAN, &Wire, -1);
+unsigned long dernierAffichage = 0;
+const unsigned long PERIODE_AFFICHAGE_MS = 1000;
+
+char tamponCmd[32];
+byte indexCmd = 0;
+
+void appliquerHeure(const char* str) {
+  int h, m, s, jour, mois, annee;
+  if (sscanf(str + 4, "%d:%d:%d %d/%d/%d", &h, &m, &s, &jour, &mois, &annee) == 6) {
+    RtcDateTime dt(annee, mois, jour, h, m, s);
+    Rtc.SetDateTime(dt);
+    Serial.print(F("-> Heure mise a jour : "));
+    Serial.println(str + 4);
+  } else {
+    Serial.println(F("Format incorrect. Exemple : SET 12:15:00 11/10/2026"));
+  }
+}
 
 void setup() {
-  Serial.begin(9600);
-  myRTC.init();
+  Serial.begin(115200);
 
-  if (!ecran.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("Ecran non detecte (verifiez le cablage SDA/SCL et l'adresse I2C)");
-    while (true) {
-      delay(1000);
-    }
+  // Initialisation RTC
+  Rtc.Begin();
+  if (Rtc.GetIsWriteProtected()) {
+    Rtc.SetIsWriteProtected(false);
+  }
+  if (!Rtc.GetIsRunning()) {
+    Rtc.SetIsRunning(true);
   }
 
-  // --- DÉCOMMENTEZ LE BLOC CI-DESSOUS UNIQUEMENT POUR RÉGLER L'HEURE (ajustez hour/minute/second
-  // à l'heure actuelle avant de téléverser, puis REMETTEZ CE BLOC EN COMMENTAIRE et reflashez) ---
-  // Ds1302::DateTime dt;
-  // dt.year = 26;   // 2026
-  // dt.month = 10;
-  // dt.day = 6;
-  // dt.hour = 12;   // <-- à corriger avec l'heure réelle
-  // dt.minute = 0;  // <-- à corriger avec l'heure réelle
-  // dt.second = 0;
-  // dt.dow = Ds1302::DOW_TUE;
-  // myRTC.setDateTime(&dt);
+  // Initialisation écran OLED
+  u8g2.begin();
+
+  Serial.println(F("=== FS2 Pret (U8g2 SW I2C sur A3/A4) ==="));
+  Serial.println(F("Format reglage : SET HH:MM:SS JJ/MM/AAAA"));
 }
 
 void loop() {
-  Ds1302::DateTime dt;
-  myRTC.getDateTime(&dt);
+  // Lecture de commande de réglage sur le port série
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (indexCmd > 0) {
+        tamponCmd[indexCmd] = '\0';
+        if (strncmp(tamponCmd, "SET ", 4) == 0) {
+          appliquerHeure(tamponCmd);
+        }
+        indexCmd = 0;
+      }
+    } else {
+      if (indexCmd < sizeof(tamponCmd) - 1) {
+        tamponCmd[indexCmd++] = c;
+      }
+    }
+  }
 
-  char texteHeure[9];
-  snprintf(texteHeure, sizeof(texteHeure), "%02d:%02d:%02d", dt.hour, dt.minute, dt.second);
+  // Rafraîchissement chaque seconde
+  unsigned long maintenant = millis();
+  if (maintenant - dernierAffichage >= PERIODE_AFFICHAGE_MS) {
+    dernierAffichage = maintenant;
 
-  char texteDate[11];
-  snprintf(texteDate, sizeof(texteDate), "%02d/%02d/%04d", dt.day, dt.month, 2000 + dt.year);
+    RtcDateTime dt = Rtc.GetDateTime();
 
-  ecran.clearDisplay();
+    char texteHeure[10];
+    snprintf(texteHeure, sizeof(texteHeure), "%02d:%02d:%02d", dt.Hour(), dt.Minute(), dt.Second());
 
-  ecran.setTextSize(2);
-  ecran.setTextColor(SSD1306_WHITE);
-  ecran.setCursor(10, 20);
-  ecran.println(texteHeure);
+    char texteDate[12];
+    snprintf(texteDate, sizeof(texteDate), "%02d/%02d/%04d", dt.Day(), dt.Month(), dt.Year());
 
-  ecran.setTextSize(1);
-  ecran.setCursor(20, 45);
-  ecran.println(texteDate);
+    // Affichage U8g2 (mode page buffer pour économiser la RAM)
+    u8g2.firstPage();
+    do {
+      u8g2.setFont(u8g2_font_logisoso16_tf);
+      u8g2.drawStr(18, 28, texteHeure);
 
-  ecran.display();
+      u8g2.setFont(u8g2_font_6x12_tf);
+      u8g2.drawStr(30, 52, texteDate);
+    } while (u8g2.nextPage());
 
-  // Affichage de l'heure actuelle sur le moniteur série aussi
-  Serial.print("Heure actuelle : ");
-  Serial.print(texteHeure);
-  Serial.print(" | Date : ");
-  Serial.println(texteDate);
-
-  delay(1000);
+    // Log série
+    Serial.print(texteHeure);
+    Serial.print(F(" | "));
+    Serial.println(texteDate);
+  }
 }
