@@ -15,15 +15,15 @@ RtcDS1302<ThreeWire> Rtc(monFil);
 U8G2_SSD1306_128X64_NONAME_1_SW_I2C u8g2(U8G2_R0, /* clock=*/ A4, /* data=*/ A3, /* reset=*/ U8X8_PIN_NONE);
 
 // --- Encodeur EC11 ---
-const byte PIN_ENC_A  = 10;
-const byte PIN_ENC_B  = 12;
-const byte PIN_ENC_SW = 11; // Axe poussoir (S2)
+const byte PIN_ENC_A    = 10;
+const byte PIN_ENC_B    = 12;
+const byte PIN_ENC_SW   = 11; // Axe poussoir (S2)
 
-// --- Buzzer & Bouton FS4 préservé ---
+// --- Buzzer & Bouton FS4 ---
 const byte PIN_BUZZER = 5;
-const byte PIN_BOUTON_MUTE = 9; // Dédié exclusivement au son FS4
+const byte PIN_BOUTON_MUTE = 9;
 
-// --- Structure de données en EEPROM (ET6.1, ET6.3) ---
+// --- Structure EEPROM (ET6.1, ET6.3) ---
 #define ADRESSE_MAGIC       0    
 #define ADRESSE_NB_MESURES  2    
 #define ADRESSE_LANGUE      3    
@@ -35,13 +35,12 @@ struct MesureEEPROM {
   uint8_t bpm;
   uint8_t jour;
   uint8_t mois;
-  uint8_t annee; // offset année 2000
+  uint8_t annee;
   uint8_t heure;
   uint8_t minute;
   uint8_t seconde;
 };
 
-// --- États du système ---
 enum Langue { FR = 0, EN = 1 };
 Langue langueActive = FR;
 
@@ -52,29 +51,30 @@ int indexHistorique = 0;
 uint8_t nbMesuresStockees = 0;
 byte optionSelectionnee = 0; // 0 = Langue, 1 = Effacer
 
-// Moyenne de 10 mesures (ET6.2)
+// Moyenne sur 10 points (ET6.2)
 bool acquisitionEnCours = false;
 uint8_t compteurEchantillons = 0;
 uint16_t sommeBpm = 0;
 unsigned long dernierEchantillon = 0;
 
-// Gestion Encodeur & Interruption
+// Encodeur
 volatile int deltaEncodeur = 0;
 volatile unsigned long dernierTempsInterruption = 0;
 
-// Détection Appui Court / Long sur D11
-bool etatPrecedentSW = HIGH;
-unsigned long tempsDebutAppui = 0;
-const unsigned long SEUIL_APPUI_LONG_MS = 600;
+// Seuils temporels d'appui
+const unsigned long SEUIL_APPUI_COURT_MS = 2000; // Entre 2s et 6s -> court
+const unsigned long SEUIL_APPUI_LONG_MS  = 6000; // >= 6s à 10s -> long
+bool boutonEstEnfonce = false;
+unsigned long tempsDebutEnfonce = 0;
+unsigned long dureeAppuiCourante = 0;
 
-// Variables pour bouton Mute (FS4)
+// Variables FS4 Mute
 bool sonActif = true;
 bool dernierEtatMute = HIGH;
 unsigned long dernierDebounceMute = 0;
 
 unsigned long dernierAffichage = 0;
 
-// Interruption PCINT pour les crans de rotation (D10 / D12)
 ISR(PCINT0_vect) {
   uint8_t etatA = (PINB & (1 << PINB2)) ? HIGH : LOW;
   uint8_t etatB = (PINB & (1 << PINB4)) ? HIGH : LOW;
@@ -90,7 +90,6 @@ ISR(PCINT0_vect) {
   }
 }
 
-// EEPROM
 void initialiserEEPROM() {
   uint16_t magic;
   EEPROM.get(ADRESSE_MAGIC, magic);
@@ -112,7 +111,6 @@ void effacerHistoriqueEEPROM() {
   nbMesuresStockees = 0;
   EEPROM.write(ADRESSE_NB_MESURES, 0);
   indexHistorique = 0;
-  Serial.println(F("EEPROM : Historique efface."));
 }
 
 void sauvegarderMesure(uint8_t bpmMoyen, RtcDateTime dt) {
@@ -138,10 +136,6 @@ void sauvegarderMesure(uint8_t bpmMoyen, RtcDateTime dt) {
   EEPROM.put(adresse, m);
   nbMesuresStockees++;
   EEPROM.write(ADRESSE_NB_MESURES, nbMesuresStockees);
-
-  Serial.print(F("EEPROM : Moyenne enregistree -> "));
-  Serial.print(bpmMoyen);
-  Serial.println(F(" BPM"));
 }
 
 MesureEEPROM lireMesure(uint8_t index) {
@@ -151,10 +145,32 @@ MesureEEPROM lireMesure(uint8_t index) {
   return m;
 }
 
-// Affichage écran
 void dessinerInterface() {
   u8g2.firstPage();
   do {
+    // Si le bouton est actuellement maintenu, on affiche un retour visuel des secondes
+    if (boutonEstEnfonce) {
+      u8g2.setFont(u8g2_font_6x10_tf);
+      u8g2.drawStr(14, 18, (langueActive == FR) ? "APPUI EN COURS..." : "HOLDING BUTTON...");
+
+      char strSec[15];
+      snprintf(strSec, sizeof(strSec), "%lu s / 6s", dureeAppuiCourante / 1000);
+      u8g2.drawStr(36, 34, strSec);
+
+      // Barre de progression vers les 6 secondes
+      u8g2.drawFrame(14, 42, 100, 8);
+      int largeur = map(constrain(dureeAppuiCourante, 0, SEUIL_APPUI_LONG_MS), 0, SEUIL_APPUI_LONG_MS, 0, 100);
+      u8g2.drawBox(14, 42, largeur, 8);
+
+      u8g2.setFont(u8g2_font_4x6_tf);
+      if (dureeAppuiCourante >= SEUIL_APPUI_LONG_MS) {
+        u8g2.drawStr(20, 58, (langueActive == FR) ? "RELACHER POUR SAUVER !" : "RELEASE TO SAVE !");
+      } else if (dureeAppuiCourante >= SEUIL_APPUI_COURT_MS) {
+        u8g2.drawStr(20, 58, (langueActive == FR) ? "Relacher pour Menu" : "Release for Menu");
+      }
+      continue;
+    }
+
     if (modeActuel == MODE_NORMAL) {
       RtcDateTime dt = Rtc.GetDateTime();
       char bufH[9];
@@ -172,7 +188,7 @@ void dessinerInterface() {
       } else {
         u8g2.drawStr(14, 44, (langueActive == FR) ? "POULS : 72 bpm" : "PULSE : 72 bpm");
         u8g2.setFont(u8g2_font_4x6_tf);
-        u8g2.drawStr(8, 58, (langueActive == FR) ? "Appui court=Menu  Long=Sauver" : "Short=Menu  Long=Save");
+        u8g2.drawStr(8, 58, (langueActive == FR) ? "Maintenir 3s=Menu  6s=Sauver" : "Hold 3s=Menu  6s=Save");
       }
     } 
     else if (modeActuel == MODE_HISTORIQUE) {
@@ -201,24 +217,21 @@ void dessinerInterface() {
       }
 
       u8g2.setFont(u8g2_font_4x6_tf);
-      u8g2.drawStr(4, 60, (langueActive == FR) ? "Rot=Defiler  Court=Options" : "Rot=Scroll  Short=Options");
+      u8g2.drawStr(4, 60, (langueActive == FR) ? "Rot=Defiler  3s=Options" : "Rot=Scroll  3s=Options");
     }
     else if (modeActuel == MODE_OPTIONS) {
       u8g2.setFont(u8g2_font_6x10_tf);
       u8g2.drawStr(4, 10, "OPTIONS");
       u8g2.drawHLine(4, 13, 120);
 
-      // Curseur de sélection (flèche >)
       if (optionSelectionnee == 0) u8g2.drawStr(2, 28, ">");
       else u8g2.drawStr(2, 42, ">");
 
-      // Ligne 1 : Langue
       u8g2.drawStr(12, 28, (langueActive == FR) ? "Langue : [FR]" : "Language : [EN]");
-      // Ligne 2 : Effacement
       u8g2.drawStr(12, 42, (langueActive == FR) ? "Effacer historique" : "Clear memory");
 
       u8g2.setFont(u8g2_font_4x6_tf);
-      u8g2.drawStr(4, 58, (langueActive == FR) ? "Rot=Choix  Long=Valider  Court=Retour" : "Rot=Pick  Long=Select  Short=Back");
+      u8g2.drawStr(4, 58, (langueActive == FR) ? "Rot=Choix  6s=Valider  3s=Retour" : "Rot=Pick  6s=Select  3s=Back");
     }
   } while (u8g2.nextPage());
 }
@@ -233,7 +246,6 @@ void setup() {
   pinMode(PIN_BUZZER, OUTPUT);
   pinMode(PIN_BOUTON_MUTE, INPUT_PULLUP);
 
-  // Interruption PCINT pour la rotation de l'axe (D10 / D12)
   cli();
   PCICR |= (1 << PCIE0);
   PCMSK0 |= (1 << PCINT2) | (1 << PCINT4);
@@ -246,13 +258,13 @@ void setup() {
   u8g2.begin();
   initialiserEEPROM();
 
-  Serial.println(F("=== FS6 : Gestion 100% Encodeur ==="));
+  Serial.println(F("=== FS6 Pret (3s Court / 6s Long avec barre) ==="));
 }
 
 void loop() {
   unsigned long maintenant = millis();
 
-  // 1. Gestion du bouton Mute (FS4 sur D9)
+  // 1. Bouton Mute FS4 (D9)
   bool lectureMute = digitalRead(PIN_BOUTON_MUTE);
   if (lectureMute != dernierEtatMute && (maintenant - dernierDebounceMute > 50)) {
     if (lectureMute == LOW) {
@@ -265,7 +277,7 @@ void loop() {
   }
   dernierEtatMute = lectureMute;
 
-  // 2. Navigation par rotation de l'encodeur
+  // 2. Rotation encodeur
   if (deltaEncodeur != 0) {
     if (modeActuel == MODE_HISTORIQUE && nbMesuresStockees > 0) {
       indexHistorique += deltaEncodeur;
@@ -277,52 +289,64 @@ void loop() {
     deltaEncodeur = 0;
   }
 
-  // 3. Gestion Appui Court / Appui Long sur l'axe encodeur (D11)
+  // 3. Gestion continue de l'appui sur l'axe encodeur (D11)
   bool lectureSW = digitalRead(PIN_ENC_SW);
-  if (lectureSW != etatPrecedentSW) {
-    if (lectureSW == LOW) {
-      // Début d'appui
-      tempsDebutAppui = maintenant;
-    } else {
-      // Relâchement : analyse de la durée
-      unsigned long duree = maintenant - tempsDebutAppui;
-      if (duree >= 50 && duree < SEUIL_APPUI_LONG_MS) {
-        // --- APPUI COURT ---
-        if (modeActuel == MODE_NORMAL) {
-          modeActuel = MODE_HISTORIQUE;
-        } else if (modeActuel == MODE_HISTORIQUE) {
-          modeActuel = MODE_OPTIONS;
-        } else {
-          modeActuel = MODE_NORMAL;
-        }
-      } else if (duree >= SEUIL_APPUI_LONG_MS) {
-        // --- APPUI LONG ---
+
+  if (lectureSW == LOW) {
+    // Le bouton est maintenu enfoncé
+    if (!boutonEstEnfonce) {
+      boutonEstEnfonce = true;
+      tempsDebutEnfonce = maintenant;
+    }
+    dureeAppuiCourante = maintenant - tempsDebutEnfonce;
+  } else {
+    // Le bouton vient d'être relâché
+    if (boutonEstEnfonce) {
+      unsigned long dureeTotale = maintenant - tempsDebutEnfonce;
+      boutonEstEnfonce = false;
+      dureeAppuiCourante = 0;
+
+      Serial.print(F("Appui relache apres : "));
+      Serial.print(dureeTotale);
+      Serial.println(F(" ms"));
+
+      if (dureeTotale >= SEUIL_APPUI_LONG_MS) {
+        // --- APPUI LONG (>= 6 secondes) ---
         if (modeActuel == MODE_NORMAL && !acquisitionEnCours) {
-          // Lance la moyenne des 10 points (ET6.2)
           acquisitionEnCours = true;
           compteurEchantillons = 0;
           sommeBpm = 0;
-          Serial.println(F("Appui long : Enregistrement de 10 points lance..."));
+          Serial.println(F("-> Lancement enregistrement 10 mesures moyennes"));
         } else if (modeActuel == MODE_OPTIONS) {
           if (optionSelectionnee == 0) {
-            // Bascule langue (ET6.5)
             langueActive = (langueActive == FR) ? EN : FR;
             EEPROM.write(ADRESSE_LANGUE, (uint8_t)langueActive);
-            Serial.println(F("Options : Langue modifiee"));
+            Serial.println(F("-> Changement de langue"));
           } else {
-            // Effacement (ET6.4)
             effacerHistoriqueEEPROM();
+            Serial.println(F("-> Historique efface"));
           }
+        }
+      } else if (dureeTotale >= SEUIL_APPUI_COURT_MS) {
+        // --- APPUI COURT (entre 2 et 6 secondes) ---
+        if (modeActuel == MODE_NORMAL) {
+          modeActuel = MODE_HISTORIQUE;
+          Serial.println(F("-> Passage en mode HISTORIQUE"));
+        } else if (modeActuel == MODE_HISTORIQUE) {
+          modeActuel = MODE_OPTIONS;
+          Serial.println(F("-> Passage en mode OPTIONS"));
+        } else {
+          modeActuel = MODE_NORMAL;
+          Serial.println(F("-> Retour en mode NORMAL"));
         }
       }
     }
-    etatPrecedentSW = lectureSW;
   }
 
-  // 4. Calcul de la moyenne de 10 mesures (ET6.2)
+  // 4. Calcul de la moyenne sur 10 points
   if (acquisitionEnCours && (maintenant - dernierEchantillon >= 140)) {
     dernierEchantillon = maintenant;
-    int mesureInstantanee = 70 + random(0, 5); // Simulé pour le test
+    int mesureInstantanee = 70 + random(0, 5);
     sommeBpm += mesureInstantanee;
     compteurEchantillons++;
 
@@ -334,7 +358,7 @@ void loop() {
     }
   }
 
-  // 5. Rafraîchissement de l'affichage
+  // 5. Rafraîchissement régulier de l'écran
   if (maintenant - dernierAffichage >= 90) {
     dernierAffichage = maintenant;
     dessinerInterface();
