@@ -1,126 +1,143 @@
 #include <Arduino.h>
 #include <U8g2lib.h>
+#include <ThreeWire.h>
+#include <RtcDS1302.h>
 
-// --- Configuration des broches ---
-// Écran 1 : Heure & BPM (A4 = SCL, A3 = SDA)
+// --- RTC DS1302 (D2, D3, D4) ---
+const int RST_PIN = 2; // CE
+const int DAT_PIN = 3; // IO
+const int CLK_PIN = 4; // SCLK
+
+ThreeWire monFil(DAT_PIN, CLK_PIN, RST_PIN);
+RtcDS1302<ThreeWire> Rtc(monFil);
+
+// --- Écrans OLED (Software I2C) ---
 U8G2_SSD1306_128X64_NONAME_1_SW_I2C ecran1(U8G2_R0, /* clock=*/ A4, /* data=*/ A3, /* reset=*/ U8X8_PIN_NONE);
-
-// Écran 2 : Oscilloscope PPG gradué (A2 = SCL, A1 = SDA)
 U8G2_SSD1306_128X64_NONAME_1_SW_I2C ecran2(U8G2_R0, /* clock=*/ A2, /* data=*/ A1, /* reset=*/ U8X8_PIN_NONE);
 
-// Encodeur EC11
+// --- Encodeur EC11 ---
 const byte PIN_ENC_A  = 10;
 const byte PIN_ENC_B  = 12;
 const byte PIN_ENC_SW = 11;
 
-// --- Paramètres de l'oscilloscope PPG (ET5.2, ET5.3, ET5.4) ---
-const byte LARGEUR_TRACE = 90; // Pixels alloués au signal (x de 10 à 99)
-const byte HAUTEUR_TRACE = 40; // Pixels alloués (y de 14 à 54)
-const byte Y_BASE = 54;        // Ligne zéro sur l'écran
+// --- Échelles d'oscilloscope (ET5.4) ---
+const uint8_t NB_ECHELLES = 3;
+const unsigned int ECHELLES_MS[NB_ECHELLES] = {10, 25, 50}; // 10ms, 25ms, 50ms par point
+const char NOMS_ECHELLES[3][8] = {"10ms", "25ms", "50ms"};
+volatile int8_t indexEchelle = 1; // 25ms par défaut
 
+// --- Oscilloscope PPG ---
+const byte LARGEUR_TRACE = 88;
+const byte HAUTEUR_TRACE = 36;
+const byte Y_BASE = 54;
 uint8_t bufferPPG[LARGEUR_TRACE];
 byte indexTrace = 0;
 
-// Échelles de temps (décimation temporelle en ms par pixel)
-const uint8_t NB_ECHELLES = 3;
-const unsigned int ECHELLES_MS[NB_ECHELLES] = {10, 20, 40}; // 10ms/px (0.9s), 20ms/px (1.8s), 40ms/px (3.6s)
-const char* NOMS_ECHELLES[NB_ECHELLES] = {"10ms/pt", "20ms/pt", "40ms/pt"};
-volatile int8_t indexEchelle = 1; // Par défaut : 20 ms/pixel
-
-// Variables de gestion de l'encodeur
-byte dernierEtatA = HIGH;
-unsigned long dernierEchantillonPPG = 0;
-unsigned long dernierAffichageEcrans = 0;
-
-// Variables simulées pour le test FS5
-float bpmAffiche = 65.0f;
+// Variables globales
+char strHeure[9] = "14:30:00";
+int bpmAffiche = 65;
 bool doigtDetecte = true;
-char texteHeure[9] = "12:30:00";
 
-// Lecture de l'encodeur rotatif (ET5.4)
-void lireEncodeur() {
-  byte etatA = digitalRead(PIN_ENC_A);
-  if (etatA != dernierEtatA && etatA == LOW) { // Front descendant sur A
-    if (digitalRead(PIN_ENC_B) == HIGH) {
+unsigned long dernierTempsEch = 0;
+unsigned long dernierAffichagePPG = 0;
+unsigned long dernierAffichageHeure = 0;
+unsigned long dernierRtc = 0;
+
+bool dernierEtatSW = HIGH;
+unsigned long dernierDebounceSW = 0;
+
+// Anti-rebond encodeur
+volatile unsigned long dernierTempsInterruption = 0;
+
+ISR(PCINT0_vect) {
+  uint8_t etatA = (PINB & (1 << PINB2)) ? HIGH : LOW; // D10
+  uint8_t etatB = (PINB & (1 << PINB4)) ? HIGH : LOW; // D12
+
+  unsigned long maintenant = millis();
+  if (etatA == LOW && (maintenant - dernierTempsInterruption > 40)) {
+    dernierTempsInterruption = maintenant;
+    if (etatB == HIGH) {
       if (indexEchelle < NB_ECHELLES - 1) indexEchelle++;
     } else {
       if (indexEchelle > 0) indexEchelle--;
     }
-    Serial.print(F("Base de temps modifiee : "));
-    Serial.println(NOMS_ECHELLES[indexEchelle]);
   }
-  dernierEtatA = etatA;
 }
 
-// Générateur d'onde pour test visuel
-float genererOndeTest() {
-  static float phase = 0;
-  phase += 0.08f;
-  if (phase > 6.283f) phase -= 6.283f;
-  // Onde asymétrique simulant le pouls systolique + dicrote
-  float val = (sin(phase) + 0.5f * sin(2.0f * phase));
-  if (val < 0) val = 0;
-  return val / 1.5f; // Normalisé ~ [0.0 ; 1.0]
+// Onde PPG simulée (battement cardiaque standard ~65 BPM : période = 920 ms)
+uint8_t calculerOndePhysiologique(unsigned long t_ms) {
+  const unsigned long T_BATTEMENT = 920;
+  unsigned long phase = t_ms % T_BATTEMENT;
+
+  if (phase < 140) {
+    // Montée systolique
+    return (uint8_t)((phase * (HAUTEUR_TRACE - 2)) / 140);
+  } else if (phase < 300) {
+    // Descente vers incisure dicrote
+    return (uint8_t)((HAUTEUR_TRACE - 2) - ((phase - 140) * ((HAUTEUR_TRACE - 2) - 10)) / 160);
+  } else if (phase < 440) {
+    // Onde dicrote (rebond)
+    return (uint8_t)(10 + ((phase - 300) * 10) / 140);
+  } else if (phase < 580) {
+    // Descente finale vers zéro
+    return (uint8_t)(20 - ((phase - 440) * 20) / 140);
+  } else {
+    // Diastole (ligne isoélectrique de base)
+    return 0;
+  }
 }
 
-// Dessin Écran 1 : Heure & BPM (ET5.1)
 void dessinerEcran1() {
   ecran1.firstPage();
   do {
-    // Cadre décoratif
-    ecran1.drawRFrame(0, 0, 128, 64, 3);
+    ecran1.setFont(u8g2_font_helvB14_tf);
+    ecran1.drawStr(22, 22, strHeure);
 
-    // Heure
-    ecran1.setFont(u8g2_font_logisoso16_tf);
-    ecran1.drawStr(20, 24, texteHeure);
+    ecran1.drawHLine(14, 30, 100);
 
-    // Ligne de séparation
-    ecran1.drawHLine(10, 31, 108);
+    ecran1.setFont(u8g2_font_6x10_tf);
+    ecran1.drawStr(20, 50, "POULS :");
 
-    // Icône cœur & Fréquence
-    ecran1.setFont(u8g2_font_unifont_t_symbols);
-    ecran1.drawGlyph(16, 52, 0x2665); // Symbole cœur plein
-
-    ecran1.setFont(u8g2_font_profont17_tr);
-    if (doigtDetecte && bpmAffiche > 35.0f && bpmAffiche < 220.0f) {
-      char strBpm[10];
-      dtostrf(bpmAffiche, 3, 0, strBpm);
-      strcat(strBpm, " bpm");
-      ecran1.drawStr(38, 51, strBpm);
+    ecran1.setFont(u8g2_font_helvB14_tf);
+    if (doigtDetecte && bpmAffiche >= 35 && bpmAffiche <= 220) {
+      char strBpm[5];
+      itoa(bpmAffiche, strBpm, 10);
+      ecran1.drawStr(70, 51, strBpm);
+      ecran1.setFont(u8g2_font_6x10_tf);
+      ecran1.drawStr(100, 50, "bpm");
     } else {
-      ecran1.drawStr(45, 51, "-- bpm"); // ET5.1
+      ecran1.drawStr(74, 51, "--");
     }
   } while (ecran1.nextPage());
 }
 
-// Dessin Écran 2 : Graphique gradué avec échelle (ET5.2, ET5.3, ET5.4)
 void dessinerEcran2() {
   ecran2.firstPage();
   do {
-    // Titre et échelle active
+    // En-tête
     ecran2.setFont(u8g2_font_6x10_tf);
     ecran2.drawStr(4, 10, "PPG");
-    ecran2.drawStr(70, 10, NOMS_ECHELLES[indexEchelle]); // ET5.4
+    ecran2.drawStr(78, 10, NOMS_ECHELLES[indexEchelle]);
 
-    // Axes gradués (ET5.3)
-    ecran2.drawVLine(18, 12, 44); // Axe Y
-    ecran2.drawHLine(18, Y_BASE, LARGEUR_TRACE); // Axe X (temps)
+    // Axes
+    ecran2.drawVLine(18, 16, 39);
+    ecran2.drawHLine(18, Y_BASE, LARGEUR_TRACE);
 
-    // Graduations Y
-    ecran2.drawHLine(15, Y_BASE, 3);                 // 0.0
-    ecran2.drawHLine(15, Y_BASE - HAUTEUR_TRACE / 2, 3); // 0.5
-    ecran2.drawHLine(15, Y_BASE - HAUTEUR_TRACE, 3);     // 1.0
+    // Graduations Y (0.0, 0.5, 1.0)
+    ecran2.drawHLine(15, Y_BASE, 3);
+    ecran2.drawHLine(15, Y_BASE - HAUTEUR_TRACE / 2, 3);
+    ecran2.drawHLine(15, Y_BASE - HAUTEUR_TRACE, 3);
 
-    ecran2.setFont(u8g2_font_4x6_tf);
-    ecran2.drawStr(2, Y_BASE + 2, "0");
-    ecran2.drawStr(2, Y_BASE - HAUTEUR_TRACE + 5, "1");
+    ecran2.setFont(u8g2_font_5x7_tf);
+    ecran2.drawStr(6, Y_BASE + 2, "0");
+    ecran2.drawStr(6, Y_BASE - HAUTEUR_TRACE + 6, "1");
 
-    // Repères temporels sur l'axe X (petits ticks tous les 30 pixels)
-    ecran2.drawVLine(18 + 30, Y_BASE, 3);
-    ecran2.drawVLine(18 + 60, Y_BASE, 3);
-    ecran2.drawVLine(18 + 90, Y_BASE, 3);
+    // Repères horizontaux
+    ecran2.drawVLine(18 + 29, Y_BASE, 3);
+    ecran2.drawVLine(18 + 58, Y_BASE, 3);
+    ecran2.drawVLine(18 + 87, Y_BASE, 3);
 
-    // Tracé de la courbe PPG
+    // Tracé de l'onde
     for (byte i = 0; i < LARGEUR_TRACE - 1; i++) {
       byte idx1 = (indexTrace + i) % LARGEUR_TRACE;
       byte idx2 = (indexTrace + i + 1) % LARGEUR_TRACE;
@@ -140,40 +157,55 @@ void setup() {
   pinMode(PIN_ENC_B, INPUT_PULLUP);
   pinMode(PIN_ENC_SW, INPUT_PULLUP);
 
-  // Initialisation des deux écrans Software I2C
+  cli();
+  PCICR |= (1 << PCIE0);
+  PCMSK0 |= (1 << PCINT2) | (1 << PCINT4);
+  sei();
+
+  Rtc.Begin();
+  if (Rtc.GetIsWriteProtected()) Rtc.SetIsWriteProtected(false);
+  if (!Rtc.GetIsRunning()) Rtc.SetIsRunning(true);
+
   ecran1.begin();
   ecran2.begin();
 
-  // Initialisation du tampon d'affichage
   for (byte i = 0; i < LARGEUR_TRACE; i++) {
     bufferPPG[i] = 0;
   }
-
-  Serial.println(F("=== Test FS5 : Double OLED & Encodeur ==="));
 }
 
 void loop() {
   unsigned long maintenant = millis();
 
-  // 1. Écoute réactive de l'encodeur rotatif
-  lireEncodeur();
+  // 1. Bouton encodeur (bascule rapide)
+  bool lectureSW = digitalRead(PIN_ENC_SW);
+  if (lectureSW != dernierEtatSW && (maintenant - dernierDebounceSW > 60)) {
+    if (lectureSW == LOW) {
+      indexEchelle = (indexEchelle + 1) % NB_ECHELLES;
+    }
+    dernierDebounceSW = maintenant;
+  }
+  dernierEtatSW = lectureSW;
 
-  // 2. Acquisition/actualisation des points du graphique selon la base de temps
-  unsigned int periodePoint = ECHELLES_MS[indexEchelle];
-  if (maintenant - dernierEchantillonPPG >= periodePoint) {
-    dernierEchantillonPPG = maintenant;
-
-    float norm = genererOndeTest(); // En intégration finale, on injectera acNormalise de FS1
-    uint8_t pixelH = (uint8_t)(norm * (HAUTEUR_TRACE - 2));
-
-    bufferPPG[indexTrace] = pixelH;
+  // 2. Acquisition temporelle continue (rattrapage sans perte de points)
+  unsigned int dt = ECHELLES_MS[indexEchelle];
+  while (maintenant - dernierTempsEch >= dt) {
+    dernierTempsEch += dt;
+    bufferPPG[indexTrace] = calculerOndePhysiologique(dernierTempsEch);
     indexTrace = (indexTrace + 1) % LARGEUR_TRACE;
   }
 
-  // 3. Rafraîchissement alterné des deux écrans pour préserver la fluidité
-  if (maintenant - dernierAffichageEcrans >= 60) { // ~15 FPS
-    dernierAffichageEcrans = maintenant;
-    dessinerEcran1();
+  // 3. Rafraîchissement RTC chaque seconde
+  if (maintenant - dernierRtc >= 1000) {
+    dernierRtc = maintenant;
+    RtcDateTime dtRTC = Rtc.GetDateTime();
+    snprintf(strHeure, sizeof(strHeure), "%02d:%02d:%02d", dtRTC.Hour(), dtRTC.Minute(), dtRTC.Second());
+    dessinerEcran1(); // Rafraîchissement de l'heure uniquement à la seconde
+  }
+
+  // 4. Rafraîchissement régulier de l'écran PPG (~15 FPS)
+  if (maintenant - dernierAffichagePPG >= 65) {
+    dernierAffichagePPG = maintenant;
     dessinerEcran2();
   }
 }
