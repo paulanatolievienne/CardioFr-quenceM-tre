@@ -1,880 +1,703 @@
 #include <Arduino.h>
-#include <U8g2lib.h>
-#include <RtcDS1302.h>
-#include <ThreeWire.h>
 #include <EEPROM.h>
+#include <U8g2lib.h>
+#include <ThreeWire.h>
+#include <RtcDS1302.h>
 
-// ============================================================
-// PINS
-// ============================================================
+// =============================================================================
+// 1. CONFIGURATION MATÉRIELLE DES BROCHES
+// =============================================================================
+// FS1 : Capteur PPG
+const byte PIN_PPG = A0;
 
-#define OLED1_SCL A4
-#define OLED1_SDA A3
-#define OLED2_SCL A2
-#define OLED2_SDA A1
+// FS2 : RTC DS1302
+const int RST_PIN = 2; // CE
+const int DAT_PIN = 3; // IO
+const int CLK_PIN = 4; // SCLK
+ThreeWire monFil(DAT_PIN, CLK_PIN, RST_PIN);
+RtcDS1302<ThreeWire> Rtc(monFil);
 
-const int pinEncA  = 10;
-const int pinEncB  = 12;
-const int pinEncSW = 11;
+// FS3 : LED RGB (Cathode commune au GND)
+const byte PIN_LED_BLEU  = 6; // D6
+const byte PIN_LED_VERT  = 7; // D7
+const byte PIN_LED_ROUGE = 8; // D8
 
-const int rtcRST = 2;
-const int rtcDAT = 3;
-const int rtcCLK = 4;
+// FS4 : Buzzer piézo & Bouton Mute
+const byte PIN_BUZZER      = 5; // D5
+const byte PIN_BOUTON_MUTE = 9; // D9 (câblé vers GND)
 
-const int buzzerPin = 5;
+// FS5 & FS6 : Encodeur rotatif EC11
+const byte PIN_ENC_A  = 10; // D10 (PB2)
+const byte PIN_ENC_B  = 12; // D12 (PB4)
+const byte PIN_ENC_SW = 11; // D11 (Axe poussoir vers GND)
 
-const int ledYellow = 6;
-const int ledGreen  = 7;
-const int ledRed    = 8;
+// FS5 : Double écran OLED Software I2C
+U8G2_SSD1306_128X64_NONAME_1_SW_I2C ecran1(U8G2_R0, /* clock=*/ A4, /* data=*/ A3, /* reset=*/ U8X8_PIN_NONE);
+U8G2_SSD1306_128X64_NONAME_1_SW_I2C ecran2(U8G2_R0, /* clock=*/ A2, /* data=*/ A1, /* reset=*/ U8X8_PIN_NONE);
 
-const int buttonPin = 9;
-const int ppgPin = A0;
+// =============================================================================
+// 2. PARAMÈTRES ET STRUCTURES EEPROM (FS6)
+// =============================================================================
+#define ADRESSE_MAGIC       0    
+#define ADRESSE_NB_MESURES  2    
+#define ADRESSE_LANGUE      3    
+#define ADRESSE_DEBUT_DATA  4    
+#define MAX_MESURES         10
+const uint16_t EEPROM_MAGIC = 0xCAFE;
 
-// ============================================================
-// OLED
-// ============================================================
-
-U8G2_SSD1306_128X64_NONAME_1_SW_I2C u8g2_1(
-    U8G2_R0,
-    OLED1_SCL,
-    OLED1_SDA,
-    U8X8_PIN_NONE
-);
-
-U8G2_SSD1306_128X64_NONAME_1_SW_I2C u8g2_2(
-    U8G2_R0,
-    OLED2_SCL,
-    OLED2_SDA,
-    U8X8_PIN_NONE
-);
-
-// ============================================================
-// RTC
-// ============================================================
-
-ThreeWire myWire(rtcDAT, rtcCLK, rtcRST);
-RtcDS1302<ThreeWire> Rtc(myWire);
-
-// ============================================================
-// MODES
-// ============================================================
-
-enum SystemMode {
-    MODE_NORMAL,
-    MODE_MENU
+struct MesureEEPROM {
+  uint8_t bpm;
+  uint8_t jour;
+  uint8_t mois;
+  uint8_t annee; // offset par rapport à 2000
+  uint8_t heure;
+  uint8_t minute;
+  uint8_t seconde;
 };
 
-SystemMode systemMode = MODE_NORMAL;
+enum Langue { FR = 0, EN = 1 };
+Langue langueActive = FR;
 
-// ============================================================
-// ENCODEUR
-// ============================================================
+enum ModeEcran { MODE_NORMAL, MODE_HISTORIQUE, MODE_OPTIONS };
+ModeEcran modeActuel = MODE_NORMAL;
 
-int timeBaseIndex = 0;
+int indexHistorique = 0;
+uint8_t nbMesuresStockees = 0;
+byte optionSelectionnee = 0; // 0 = Langue, 1 = Effacer
 
-const int timeBases[3] = {
-    10,
-    20,
-    40
-};
+// Moyenne de 10 points (ET6.2)
+bool acquisitionEnCours = false;
+uint8_t compteurEchantillons = 0;
+uint16_t sommeBpm = 0;
+unsigned long dernierEchantillonMoyenne = 0;
 
-int menuRecordIndex = 0;
+// Seuils d'appui sur l'axe encodeur (D11)
+const unsigned long SEUIL_APPUI_COURT_MS = 2000;
+const unsigned long SEUIL_APPUI_LONG_MS  = 6000;
+bool boutonEstEnfonce = false;
+unsigned long tempsDebutEnfonce = 0;
+unsigned long dureeAppuiCourante = 0;
 
-// Détection simple de l'encodeur
-bool lastEncA = HIGH;
+// =============================================================================
+// 3. PARAMÈTRES FS1 (TRAITEMENT DU SIGNAL PPG RÉEL WPSE340)
+// =============================================================================
+const unsigned long PERIODE_ECH_MS = 10; // 100 Hz
+const float ALPHA_LISSE = 0.15f;  // Filtrage passe-bas réactif
+const float ALPHA_BASE  = 0.003f; // Suivi de composante continue (DC)
+const float ALPHA_DECAY = 0.995f; // Décroissance d'enveloppe plus souple
 
-// ============================================================
-// BPM
-// ============================================================
+float signalLisse = 0.0f;
+float ligneBase   = 0.0f;
+float creteMax    = 8.0f;
+bool ppgInitialise = false;
+unsigned long derniereLecturePPG = 0;
 
-const int BPM_MIN = 40;
-const int BPM_MAX = 200;
+// Seuils adaptés à l'amplitude réelle du capteur
+const float SEUIL_HAUT = 0.50f; // Déclenchement au passage du pic systolique
+const float SEUIL_BAS  = 0.25f; // Réarmement diastolique
+const unsigned long TEMPS_REFRACTAIRE_MS = 400; // Période réfractaire (~155 BPM max)
+bool enPic = false;
+unsigned long tempsDernierBattement = 0;
 
-float displayedBPM = 0;
+const byte TAILLE_BUFF_BPM = 5;
+float buffBpm[TAILLE_BUFF_BPM] = {0};
+byte indexBuffBpm = 0;
+float bpmFinal = 0.0f;
+bool doigtPresent = false;
+float signalNorm = 0.0f;
 
-unsigned long lastBeatTime = 0;
-unsigned long lastSignalTime = 0;
+// =============================================================================
+// 4. PARAMÈTRES FS3 (LED RGB) & FS4 (BUZZER)
+// =============================================================================
+const float SEUIL_BRADYCARDIE = 60.0f;
+const float SEUIL_TACHYCARDIE = 100.0f;
+const float BPM_MIN_VALIDE    = 35.0f;
+const float BPM_MAX_VALIDE    = 220.0f;
 
-bool beatDetected = false;
+enum EtatSante { SANTE_ETEINT, SANTE_JAUNE, SANTE_VERT, SANTE_ROUGE };
+EtatSante etatSanteCourant = SANTE_ETEINT;
 
-int signalAverage = 512;
-int signalAmplitude = 0;
+const unsigned int FREQ_GRAVE   = 440;
+const unsigned int FREQ_MODEREE = 880;
+const unsigned int FREQ_AIGUE   = 1760;
+const unsigned long DUREE_BIP_MS = 40;
 
-const int FILTER_SIZE = 16;
-int filterBuffer[FILTER_SIZE];
-int filterIndex = 0;
+unsigned long debutBip = 0;
+bool sonEnCours = false;
+bool sonActive = true;
+bool dernierEtatMute = HIGH;
+unsigned long dernierDebounceMute = 0;
 
-long filterSum = 0;
+// =============================================================================
+// 5. PARAMÈTRES FS5 (OSCILLOSCOPE & AFFICHAGE)
+// =============================================================================
+const byte LARGEUR_TRACE = 88;
+const byte HAUTEUR_TRACE = 36;
+const byte Y_BASE = 54;
+uint8_t bufferPPG[LARGEUR_TRACE];
+byte indexTrace = 0;
 
-int threshold = 0;
+const uint8_t NB_ECHELLES = 3;
+const unsigned int ECHELLES_MS[NB_ECHELLES] = {10, 25, 50};
+const char NOMS_ECHELLES[3][8] = {"10ms", "25ms", "50ms"};
+volatile int8_t indexEchelle = 1;
 
-const unsigned long MIN_BEAT_INTERVAL = 300;
-const unsigned long MAX_BEAT_INTERVAL = 2000;
+unsigned long dernierTempsTrace = 0;
+unsigned long dernierAffichagePPG = 0;
+unsigned long dernierAffichageHeure = 0;
+char strHeure[9] = "00:00:00";
 
-const unsigned long SIGNAL_TIMEOUT = 2500;
+// Interruption Encodeur
+volatile int deltaEncodeur = 0;
+volatile unsigned long dernierTempsInterruption = 0;
 
-// ============================================================
-// EEPROM
-// ============================================================
+ISR(PCINT0_vect) {
+  uint8_t etatA = (PINB & (1 << PINB2)) ? HIGH : LOW; // D10
+  uint8_t etatB = (PINB & (1 << PINB4)) ? HIGH : LOW; // D12
 
-#define EEPROM_MAGIC 0x42
-
-struct Measurement {
-    byte hour;
-    byte minute;
-    byte day;
-    byte month;
-    byte bpm;
-};
-
-const int EEPROM_START = 10;
-const int MAX_RECORDS = 20;
-
-int recordCount = 0;
-
-// ============================================================
-// MOYENNE DES 10 MESURES
-// ============================================================
-
-int bpmMeasurements[10];
-int bpmMeasurementCount = 0;
-
-// ============================================================
-// GRAPHIQUE PPG
-// ============================================================
-
-#define GRAPH_WIDTH 96
-
-int graphValues[GRAPH_WIDTH];
-
-int graphIndex = 0;
-
-unsigned long lastGraphSample = 0;
-
-// ============================================================
-// BUZZER
-// ============================================================
-
-bool buzzerMuted = false;
-unsigned long lastBuzzerTime = 0;
-
-// ============================================================
-// BOUTONS
-// ============================================================
-
-bool lastButtonState = HIGH;
-bool lastEncoderButtonState = HIGH;
-
-unsigned long buttonPressStart = 0;
-unsigned long encoderButtonPressStart = 0;
-
-// ============================================================
-// FONCTIONS EEPROM
-// ============================================================
-
-void loadEEPROM() {
-
-    if (EEPROM.read(0) != EEPROM_MAGIC) {
-        recordCount = 0;
-        return;
+  unsigned long maintenant = millis();
+  if (etatA == LOW && (maintenant - dernierTempsInterruption > 40)) {
+    dernierTempsInterruption = maintenant;
+    if (etatB == HIGH) {
+      deltaEncodeur++;
+      if (modeActuel == MODE_NORMAL && indexEchelle < NB_ECHELLES - 1) indexEchelle++;
+    } else {
+      deltaEncodeur--;
+      if (modeActuel == MODE_NORMAL && indexEchelle > 0) indexEchelle--;
     }
-
-    recordCount = EEPROM.read(1);
-
-    if (recordCount < 0 || recordCount > MAX_RECORDS) {
-        recordCount = 0;
-    }
+  }
 }
 
-void saveRecord(const Measurement &m) {
-
-    if (recordCount >= MAX_RECORDS) {
-        recordCount = 0;
-    }
-
-    int address = EEPROM_START + recordCount * sizeof(Measurement);
-
-    EEPROM.put(address, m);
-
-    recordCount++;
-
-    EEPROM.update(0, EEPROM_MAGIC);
-    EEPROM.update(1, recordCount);
+// =============================================================================
+// 6. GESTION EEPROM (FS6)
+// =============================================================================
+void initialiserEEPROM() {
+  uint16_t magic;
+  EEPROM.get(ADRESSE_MAGIC, magic);
+  if (magic != EEPROM_MAGIC) {
+    EEPROM.put(ADRESSE_MAGIC, EEPROM_MAGIC);
+    nbMesuresStockees = 0;
+    EEPROM.write(ADRESSE_NB_MESURES, 0);
+    langueActive = FR;
+    EEPROM.write(ADRESSE_LANGUE, (uint8_t)FR);
+  } else {
+    nbMesuresStockees = EEPROM.read(ADRESSE_NB_MESURES);
+    if (nbMesuresStockees > MAX_MESURES) nbMesuresStockees = 0;
+    langueActive = (Langue)EEPROM.read(ADRESSE_LANGUE);
+    if (langueActive > EN) langueActive = FR;
+  }
 }
 
-Measurement readRecord(int index) {
-
-    Measurement m;
-
-    if (index < 0 || index >= recordCount) {
-        m.hour = 0;
-        m.minute = 0;
-        m.day = 0;
-        m.month = 0;
-        m.bpm = 0;
-        return m;
-    }
-
-    int address = EEPROM_START + index * sizeof(Measurement);
-
-    EEPROM.get(address, m);
-
-    return m;
+void effacerHistoriqueEEPROM() {
+  nbMesuresStockees = 0;
+  EEPROM.write(ADRESSE_NB_MESURES, 0);
+  indexHistorique = 0;
 }
 
-void clearEEPROM() {
+void sauvegarderMesure(uint8_t bpmMoyen, RtcDateTime dt) {
+  MesureEEPROM m;
+  m.bpm = bpmMoyen;
+  m.jour = dt.Day();
+  m.mois = dt.Month();
+  m.annee = (uint8_t)(dt.Year() - 2000);
+  m.heure = dt.Hour();
+  m.minute = dt.Minute();
+  m.seconde = dt.Second();
 
-    EEPROM.update(0, 0);
-    EEPROM.update(1, 0);
+  if (nbMesuresStockees >= MAX_MESURES) {
+    for (int i = 0; i < MAX_MESURES - 1; i++) {
+      MesureEEPROM temp;
+      EEPROM.get(ADRESSE_DEBUT_DATA + (i + 1) * sizeof(MesureEEPROM), temp);
+      EEPROM.put(ADRESSE_DEBUT_DATA + i * sizeof(MesureEEPROM), temp);
+    }
+    nbMesuresStockees = MAX_MESURES - 1;
+  }
 
-    recordCount = 0;
-    menuRecordIndex = 0;
+  int adresse = ADRESSE_DEBUT_DATA + nbMesuresStockees * sizeof(MesureEEPROM);
+  EEPROM.put(adresse, m);
+  nbMesuresStockees++;
+  EEPROM.write(ADRESSE_NB_MESURES, nbMesuresStockees);
 }
 
-// ============================================================
-// SAUVEGARDE MOYENNE DE 10 MESURES
-// ============================================================
+MesureEEPROM lireMesure(uint8_t index) {
+  MesureEEPROM m;
+  int adresse = ADRESSE_DEBUT_DATA + index * sizeof(MesureEEPROM);
+  EEPROM.get(adresse, m);
+  return m;
+}
 
-void addBPMMeasurement(int bpm) {
+// =============================================================================
+// 7. GESTION ACTIONNEURS : LED RGB (FS3) & BUZZER (FS4)
+// =============================================================================
+void actualiserEtatSante() {
+  if (!doigtPresent || bpmFinal < BPM_MIN_VALIDE || bpmFinal > BPM_MAX_VALIDE) {
+    etatSanteCourant = SANTE_ETEINT;
+  } else if (bpmFinal < SEUIL_BRADYCARDIE) {
+    etatSanteCourant = SANTE_JAUNE;
+  } else if (bpmFinal <= SEUIL_TACHYCARDIE) {
+    etatSanteCourant = SANTE_VERT;
+  } else {
+    etatSanteCourant = SANTE_ROUGE;
+  }
+}
 
-    if (bpm < BPM_MIN || bpm > BPM_MAX) {
-        return;
+void piloterLedRGB() {
+  switch (etatSanteCourant) {
+    case SANTE_ETEINT:
+      digitalWrite(PIN_LED_ROUGE, LOW);
+      digitalWrite(PIN_LED_VERT, LOW);
+      digitalWrite(PIN_LED_BLEU, LOW);
+      break;
+
+    case SANTE_VERT:
+      digitalWrite(PIN_LED_ROUGE, LOW);
+      digitalWrite(PIN_LED_VERT, HIGH);
+      digitalWrite(PIN_LED_BLEU, LOW);
+      break;
+
+    case SANTE_ROUGE:
+      digitalWrite(PIN_LED_ROUGE, HIGH);
+      digitalWrite(PIN_LED_VERT, LOW);
+      digitalWrite(PIN_LED_BLEU, LOW);
+      break;
+
+    case SANTE_JAUNE:
+      digitalWrite(PIN_LED_BLEU, LOW);
+      digitalWrite(PIN_LED_ROUGE, HIGH);
+      // Hachage logiciel du vert pour compenser la sensibilité lumineuse
+      static byte cptHachage = 0;
+      cptHachage = (cptHachage + 1) % 4;
+      digitalWrite(PIN_LED_VERT, (cptHachage == 0) ? HIGH : LOW);
+      break;
+  }
+}
+
+void declencherBip(float bpm) {
+  if (!sonActive || !doigtPresent || bpm < BPM_MIN_VALIDE || bpm > BPM_MAX_VALIDE) {
+    return;
+  }
+
+  unsigned int freq = FREQ_MODEREE;
+  if (bpm < SEUIL_BRADYCARDIE) {
+    freq = FREQ_GRAVE;
+  } else if (bpm > SEUIL_TACHYCARDIE) {
+    freq = FREQ_AIGUE;
+  }
+
+  tone(PIN_BUZZER, freq);
+  debutBip = millis();
+  sonEnCours = true;
+}
+
+void gererFinBip() {
+  if (sonEnCours && (millis() - debutBip >= DUREE_BIP_MS)) {
+    noTone(PIN_BUZZER);
+    sonEnCours = false;
+  }
+}
+
+// =============================================================================
+// 8. FONCTIONS GRAPHIQUES (ÉCRAN 1 & ÉCRAN 2)
+// =============================================================================
+void dessinerEcran1() {
+  ecran1.firstPage();
+  do {
+    // 1. Retour visuel pendant la jauge d'appui sur l'encodeur
+    if (boutonEstEnfonce) {
+      ecran1.setFont(u8g2_font_6x10_tf);
+      ecran1.drawStr(14, 18, (langueActive == FR) ? "APPUI EN COURS..." : "HOLDING BUTTON...");
+
+      char strSec[15];
+      snprintf(strSec, sizeof(strSec), "%lu s / 6s", dureeAppuiCourante / 1000);
+      ecran1.drawStr(36, 34, strSec);
+
+      ecran1.drawFrame(14, 42, 100, 8);
+      int largeur = map(constrain(dureeAppuiCourante, 0, SEUIL_APPUI_LONG_MS), 0, SEUIL_APPUI_LONG_MS, 0, 100);
+      ecran1.drawBox(14, 42, largeur, 8);
+
+      ecran1.setFont(u8g2_font_4x6_tf);
+      if (dureeAppuiCourante >= SEUIL_APPUI_LONG_MS) {
+        ecran1.drawStr(18, 58, (langueActive == FR) ? "RELACHER POUR SAUVER !" : "RELEASE TO SAVE !");
+      } else if (dureeAppuiCourante >= SEUIL_APPUI_COURT_MS) {
+        ecran1.drawStr(22, 58, (langueActive == FR) ? "Relacher pour Menu" : "Release for Menu");
+      }
+      continue;
     }
 
-    if (bpmMeasurementCount < 10) {
+    // 2. Mode Normal : Heure et Fréquence cardiaque
+    if (modeActuel == MODE_NORMAL) {
+      ecran1.setFont(u8g2_font_helvB14_tf);
+      ecran1.drawStr(22, 22, strHeure);
+      ecran1.drawHLine(14, 28, 100);
 
-        bpmMeasurements[bpmMeasurementCount] = bpm;
-        bpmMeasurementCount++;
-    }
-
-    if (bpmMeasurementCount >= 10) {
-
-        long total = 0;
-
-        for (int i = 0; i < 10; i++) {
-            total += bpmMeasurements[i];
+      ecran1.setFont(u8g2_font_6x10_tf);
+      if (acquisitionEnCours) {
+        ecran1.drawStr(10, 42, (langueActive == FR) ? "ENREGISTREMENT..." : "RECORDING...");
+        ecran1.drawFrame(14, 48, 100, 8);
+        ecran1.drawBox(14, 48, compteurEchantillons * 10, 8);
+      } else {
+        ecran1.drawStr(16, 48, (langueActive == FR) ? "POULS :" : "PULSE :");
+        ecran1.setFont(u8g2_font_helvB14_tf);
+        if (doigtPresent && bpmFinal >= BPM_MIN_VALIDE && bpmFinal <= BPM_MAX_VALIDE) {
+          char strBpm[6];
+          itoa((int)(bpmFinal + 0.5f), strBpm, 10);
+          ecran1.drawStr(66, 49, strBpm);
+          ecran1.setFont(u8g2_font_6x10_tf);
+          ecran1.drawStr(100, 48, "bpm");
+        } else {
+          ecran1.drawStr(70, 49, "--");
+          ecran1.setFont(u8g2_font_6x10_tf);
+          ecran1.drawStr(98, 48, "bpm");
         }
+        ecran1.setFont(u8g2_font_4x6_tf);
+        ecran1.drawStr(12, 60, (langueActive == FR) ? "3s=Menu  6s=Sauver" : "3s=Menu  6s=Save");
+      }
+    } 
+    // 3. Mode Historique EEPROM
+    else if (modeActuel == MODE_HISTORIQUE) {
+      ecran1.setFont(u8g2_font_6x10_tf);
+      ecran1.drawStr(4, 10, (langueActive == FR) ? "HISTORIQUE" : "HISTORY");
 
-        int average = total / 10;
+      char bufInd[10];
+      snprintf(bufInd, sizeof(bufInd), "%d/%d", (nbMesuresStockees > 0) ? (indexHistorique + 1) : 0, nbMesuresStockees);
+      ecran1.drawStr(92, 10, bufInd);
+      ecran1.drawHLine(4, 13, 120);
 
-        RtcDateTime now = Rtc.GetDateTime();
+      if (nbMesuresStockees == 0) {
+        ecran1.drawStr(20, 36, (langueActive == FR) ? "Aucune mesure" : "No records");
+      } else {
+        MesureEEPROM m = lireMesure(indexHistorique);
 
-        Measurement m;
+        ecran1.setFont(u8g2_font_helvB14_tf);
+        char bufBpm[12];
+        snprintf(bufBpm, sizeof(bufBpm), "%d bpm", m.bpm);
+        ecran1.drawStr(10, 34, bufBpm);
 
-        m.hour = now.Hour();
-        m.minute = now.Minute();
-        m.day = now.Day();
-        m.month = now.Month();
-        m.bpm = average;
+        ecran1.setFont(u8g2_font_5x7_tf);
+        char bufDH[22];
+        snprintf(bufDH, sizeof(bufDH), "%02d/%02d/20%02d %02d:%02d", m.jour, m.mois, m.annee, m.heure, m.minute);
+        ecran1.drawStr(10, 48, bufDH);
+      }
 
-        saveRecord(m);
-
-        bpmMeasurementCount = 0;
+      ecran1.setFont(u8g2_font_4x6_tf);
+      ecran1.drawStr(4, 60, (langueActive == FR) ? "Rot=Defiler  3s=Options" : "Rot=Scroll  3s=Options");
     }
+    // 4. Mode Options
+    else if (modeActuel == MODE_OPTIONS) {
+      ecran1.setFont(u8g2_font_6x10_tf);
+      ecran1.drawStr(4, 10, "OPTIONS");
+      ecran1.drawHLine(4, 13, 120);
+
+      if (optionSelectionnee == 0) ecran1.drawStr(2, 28, ">");
+      else ecran1.drawStr(2, 42, ">");
+
+      ecran1.drawStr(12, 28, (langueActive == FR) ? "Langue : [FR]" : "Language : [EN]");
+      ecran1.drawStr(12, 42, (langueActive == FR) ? "Effacer historique" : "Clear memory");
+
+      ecran1.setFont(u8g2_font_4x6_tf);
+      ecran1.drawStr(4, 58, (langueActive == FR) ? "Rot=Choix  6s=Valider  3s=Retour" : "Rot=Pick  6s=Select  3s=Back");
+    }
+  } while (ecran1.nextPage());
 }
 
-// ============================================================
-// LEDS
-// ============================================================
+void dessinerEcran2() {
+  ecran2.firstPage();
+  do {
+    // En-tête
+    ecran2.setFont(u8g2_font_6x10_tf);
+    ecran2.drawStr(4, 10, "PPG");
+    ecran2.drawStr(78, 10, NOMS_ECHELLES[indexEchelle]);
 
-void updateLEDs(int bpm) {
+    // Axes
+    ecran2.drawVLine(18, 16, 39);
+    ecran2.drawHLine(18, Y_BASE, LARGEUR_TRACE);
 
-    digitalWrite(ledYellow, LOW);
-    digitalWrite(ledGreen, LOW);
-    digitalWrite(ledRed, LOW);
+    // Graduations Y
+    ecran2.drawHLine(15, Y_BASE, 3);
+    ecran2.drawHLine(15, Y_BASE - HAUTEUR_TRACE / 2, 3);
+    ecran2.drawHLine(15, Y_BASE - HAUTEUR_TRACE, 3);
 
-    if (bpm < BPM_MIN || bpm > BPM_MAX) {
-        return;
-    }
+    ecran2.setFont(u8g2_font_5x7_tf);
+    ecran2.drawStr(6, Y_BASE + 2, "0");
+    ecran2.drawStr(6, Y_BASE - HAUTEUR_TRACE + 6, "1");
 
-    if (bpm < 60) {
-        digitalWrite(ledYellow, HIGH);
+    // Repères horizontaux X
+    ecran2.drawVLine(18 + 29, Y_BASE, 3);
+    ecran2.drawVLine(18 + 58, Y_BASE, 3);
+    ecran2.drawVLine(18 + 87, Y_BASE, 3);
+
+    // Tracé de l'onde PPG réelle
+    for (byte i = 0; i < LARGEUR_TRACE - 1; i++) {
+      byte idx1 = (indexTrace + i) % LARGEUR_TRACE;
+      byte idx2 = (indexTrace + i + 1) % LARGEUR_TRACE;
+
+      byte y1 = Y_BASE - bufferPPG[idx1];
+      byte y2 = Y_BASE - bufferPPG[idx2];
+
+      ecran2.drawLine(18 + i, y1, 18 + i + 1, y2);
     }
-    else if (bpm <= 100) {
-        digitalWrite(ledGreen, HIGH);
-    }
-    else {
-        digitalWrite(ledRed, HIGH);
-    }
+  } while (ecran2.nextPage());
 }
 
-// ============================================================
-// BUZZER
-// ============================================================
-
-void beepForBPM(int bpm) {
-
-    if (buzzerMuted) {
-        return;
-    }
-
-    if (bpm < BPM_MIN || bpm > BPM_MAX) {
-        return;
-    }
-
-    int frequency;
-
-    if (bpm < 60) {
-        frequency = 600;
-    }
-    else if (bpm <= 100) {
-        frequency = 1000;
-    }
-    else {
-        frequency = 1800;
-    }
-
-    tone(buzzerPin, frequency, 60);
-}
-
-// ============================================================
-// FILTRAGE PPG
-// ============================================================
-
-int readFilteredPPG() {
-
-    int value = analogRead(ppgPin);
-
-    filterSum -= filterBuffer[filterIndex];
-
-    filterBuffer[filterIndex] = value;
-
-    filterSum += value;
-
-    filterIndex++;
-
-    if (filterIndex >= FILTER_SIZE) {
-        filterIndex = 0;
-    }
-
-    return filterSum / FILTER_SIZE;
-}
-
-// ============================================================
-// DETECTION DU BATTEMENT
-// ============================================================
-
-void processPPG() {
-
-    int signal = readFilteredPPG();
-
-    signalAverage = (signalAverage * 15 + signal) / 16;
-
-    int centeredSignal = signal - signalAverage;
-
-    int absoluteSignal = abs(centeredSignal);
-
-    signalAmplitude = (signalAmplitude * 15 + absoluteSignal) / 16;
-
-    threshold = (signalAmplitude * 65) / 100;
-
-    unsigned long now = millis();
-
-    // --------------------------------------------------------
-    // Détection avec seuil
-    // --------------------------------------------------------
-
-    if (!beatDetected) {
-
-        if (centeredSignal > threshold) {
-
-            unsigned long interval = now - lastBeatTime;
-
-            if (interval >= MIN_BEAT_INTERVAL &&
-                interval <= MAX_BEAT_INTERVAL) {
-
-                int bpm = 60000 / interval;
-
-                if (bpm >= BPM_MIN && bpm <= BPM_MAX) {
-
-                    displayedBPM =
-                        (displayedBPM * 2.0 + bpm) / 3.0;
-
-                    addBPMMeasurement(bpm);
-
-                    updateLEDs((int)displayedBPM);
-
-                    beepForBPM((int)displayedBPM);
-
-                    lastBeatTime = now;
-                    lastSignalTime = now;
-
-                    beatDetected = true;
-                }
-            }
-            else if (lastBeatTime == 0) {
-
-                lastBeatTime = now;
-            }
-        }
-    }
-    else {
-
-        // Hystérésis
-        if (centeredSignal < threshold * 0.40) {
-            beatDetected = false;
-        }
-    }
-
-    // --------------------------------------------------------
-    // Timeout
-    // --------------------------------------------------------
-
-    if (lastBeatTime != 0 &&
-        now - lastBeatTime > SIGNAL_TIMEOUT) {
-
-        displayedBPM = 0;
-
-        digitalWrite(ledYellow, LOW);
-        digitalWrite(ledGreen, LOW);
-        digitalWrite(ledRed, LOW);
-    }
-
-    // --------------------------------------------------------
-    // Graphique
-    // --------------------------------------------------------
-
-    unsigned long graphPeriod =
-        (unsigned long)timeBases[timeBaseIndex];
-
-    if (now - lastGraphSample >= graphPeriod) {
-
-        lastGraphSample = now;
-
-        graphValues[graphIndex] = signal;
-
-        graphIndex++;
-
-        if (graphIndex >= GRAPH_WIDTH) {
-            graphIndex = 0;
-        }
-    }
-}
-
-// ============================================================
-// ECRAN 1
-// ============================================================
-
-void drawScreen1() {
-
-    u8g2_1.firstPage();
-
-    do {
-
-        u8g2_1.setFont(u8g2_font_6x10_tr);
-
-        if (systemMode == MODE_NORMAL) {
-
-            RtcDateTime now = Rtc.GetDateTime();
-
-            char timeText[10];
-
-            snprintf(
-                timeText,
-                sizeof(timeText),
-                "%02d:%02d:%02d",
-                now.Hour(),
-                now.Minute(),
-                now.Second()
-            );
-
-            u8g2_1.drawStr(0, 10, timeText);
-
-            u8g2_1.drawStr(0, 27, "BPM:");
-
-            if (displayedBPM > 0) {
-
-                char bpmText[10];
-
-                snprintf(
-                    bpmText,
-                    sizeof(bpmText),
-                    "%d",
-                    (int)displayedBPM
-                );
-
-                u8g2_1.drawStr(35, 27, bpmText);
-            }
-            else {
-
-                u8g2_1.drawStr(35, 27, "--");
-            }
-
-            u8g2_1.drawStr(0, 45, "PPG Cardio");
-
-            u8g2_1.drawStr(
-                0,
-                60,
-                buzzerMuted ? "Buzzer OFF" : "Buzzer ON"
-            );
-        }
-
-        else {
-
-            u8g2_1.drawStr(0, 10, "MENU EEPROM");
-
-            if (recordCount == 0) {
-
-                u8g2_1.drawStr(0, 30, "Aucune mesure");
-            }
-            else {
-
-                Measurement m =
-                    readRecord(menuRecordIndex);
-
-                char line[25];
-
-                snprintf(
-                    line,
-                    sizeof(line),
-                    "%d/%d",
-                    menuRecordIndex + 1,
-                    recordCount
-                );
-
-                u8g2_1.drawStr(0, 25, line);
-
-                snprintf(
-                    line,
-                    sizeof(line),
-                    "%02d:%02d  %d BPM",
-                    m.hour,
-                    m.minute,
-                    m.bpm
-                );
-
-                u8g2_1.drawStr(0, 42, line);
-
-                snprintf(
-                    line,
-                    sizeof(line),
-                    "%02d/%02d",
-                    m.day,
-                    m.month
-                );
-
-                u8g2_1.drawStr(0, 58, line);
-            }
-        }
-
-    } while (u8g2_1.nextPage());
-}
-
-// ============================================================
-// ECRAN 2
-// ============================================================
-
-void drawScreen2() {
-
-    u8g2_2.firstPage();
-
-    do {
-
-        u8g2_2.setFont(u8g2_font_6x10_tr);
-
-        char info[25];
-
-        snprintf(
-            info,
-            sizeof(info),
-            "A0:%d %dms/px",
-            signalAverage,
-            timeBases[timeBaseIndex]
-        );
-
-        u8g2_2.drawStr(0, 9, info);
-
-        // Axe horizontal
-        u8g2_2.drawLine(
-            15,
-            60,
-            127,
-            60
-        );
-
-        // Axe vertical
-        u8g2_2.drawLine(
-            15,
-            15,
-            15,
-            60
-        );
-
-        // Graphique
-        for (int x = 0; x < GRAPH_WIDTH - 1; x++) {
-
-            int i1 =
-                (graphIndex + x) % GRAPH_WIDTH;
-
-            int i2 =
-                (graphIndex + x + 1) % GRAPH_WIDTH;
-
-            int y1 =
-                map(
-                    graphValues[i1],
-                    0,
-                    1023,
-                    58,
-                    18
-                );
-
-            int y2 =
-                map(
-                    graphValues[i2],
-                    0,
-                    1023,
-                    58,
-                    18
-                );
-
-            u8g2_2.drawLine(
-                16 + x,
-                y1,
-                17 + x,
-                y2
-            );
-        }
-
-    } while (u8g2_2.nextPage());
-}
-
-// ============================================================
-// ENCODEUR ROTATIF
-// ============================================================
-
-void processEncoder() {
-
-    bool encA = digitalRead(pinEncA);
-    bool encB = digitalRead(pinEncB);
-
-    // On détecte le front descendant de A
-    if (lastEncA == HIGH && encA == LOW) {
-
-        if (encB == HIGH) {
-
-            // Sens 1
-            if (systemMode == MODE_NORMAL) {
-
-                timeBaseIndex++;
-
-                if (timeBaseIndex >= 3) {
-                    timeBaseIndex = 0;
-                }
-            }
-            else {
-
-                if (recordCount > 0) {
-
-                    menuRecordIndex++;
-
-                    if (menuRecordIndex >= recordCount) {
-                        menuRecordIndex = 0;
-                    }
-                }
-            }
-        }
-
-        else {
-
-            // Sens 2
-            if (systemMode == MODE_NORMAL) {
-
-                if (timeBaseIndex == 0) {
-                    timeBaseIndex = 2;
-                }
-                else {
-                    timeBaseIndex--;
-                }
-            }
-            else {
-
-                if (recordCount > 0) {
-
-                    if (menuRecordIndex == 0) {
-                        menuRecordIndex = recordCount - 1;
-                    }
-                    else {
-                        menuRecordIndex--;
-                    }
-                }
-            }
-        }
-    }
-
-    lastEncA = encA;
-}
-
-// ============================================================
-// BOUTON D9
-// ============================================================
-
-void processMainButton() {
-
-    bool state = digitalRead(buttonPin);
-
-    if (lastButtonState == HIGH && state == LOW) {
-
-        buttonPressStart = millis();
-    }
-
-    if (lastButtonState == LOW && state == HIGH) {
-
-        unsigned long duration =
-            millis() - buttonPressStart;
-
-        // Appui court : mute buzzer
-        if (duration < 1000) {
-
-            buzzerMuted = !buzzerMuted;
-
-            if (buzzerMuted) {
-                noTone(buzzerPin);
-            }
-        }
-    }
-
-    lastButtonState = state;
-}
-
-// ============================================================
-// BOUTON ENCODEUR D11
-// ============================================================
-
-void processEncoderButton() {
-
-    bool state = digitalRead(pinEncSW);
-
-    if (lastEncoderButtonState == HIGH &&
-        state == LOW) {
-
-        encoderButtonPressStart = millis();
-    }
-
-    if (lastEncoderButtonState == LOW &&
-        state == HIGH) {
-
-        unsigned long duration =
-            millis() - encoderButtonPressStart;
-
-        // Appui long : effacement EEPROM
-        if (duration >= 1500) {
-
-            clearEEPROM();
-        }
-
-        // Appui court : menu
-        else {
-
-            if (systemMode == MODE_NORMAL) {
-
-                systemMode = MODE_MENU;
-                menuRecordIndex = 0;
-            }
-            else {
-
-                systemMode = MODE_NORMAL;
-            }
-        }
-    }
-
-    lastEncoderButtonState = state;
-}
-
-// ============================================================
-// SETUP
-// ============================================================
-
+// =============================================================================
+// 9. INITIALISATION (SETUP)
+// =============================================================================
 void setup() {
+  Serial.begin(115200);
 
-    // --------------------------------------------------------
-    // Pins
-    // --------------------------------------------------------
+  // Configuration I/O
+  pinMode(PIN_PPG, INPUT);
 
-    pinMode(pinEncA, INPUT_PULLUP);
-    pinMode(pinEncB, INPUT_PULLUP);
-    pinMode(pinEncSW, INPUT_PULLUP);
+  pinMode(PIN_LED_ROUGE, OUTPUT);
+  pinMode(PIN_LED_VERT, OUTPUT);
+  pinMode(PIN_LED_BLEU, OUTPUT);
 
-    pinMode(buttonPin, INPUT_PULLUP);
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_BOUTON_MUTE, INPUT_PULLUP);
 
-    pinMode(buzzerPin, OUTPUT);
+  pinMode(PIN_ENC_A, INPUT_PULLUP);
+  pinMode(PIN_ENC_B, INPUT_PULLUP);
+  pinMode(PIN_ENC_SW, INPUT_PULLUP);
 
-    pinMode(ledYellow, OUTPUT);
-    pinMode(ledGreen, OUTPUT);
-    pinMode(ledRed, OUTPUT);
+  // Interruption PCINT pour Encodeur sur D10 et D12
+  cli();
+  PCICR |= (1 << PCIE0);
+  PCMSK0 |= (1 << PCINT2) | (1 << PCINT4);
+  sei();
 
-    digitalWrite(ledYellow, LOW);
-    digitalWrite(ledGreen, LOW);
-    digitalWrite(ledRed, LOW);
+  // Initialisation RTC DS1302
+  Rtc.Begin();
+  if (Rtc.GetIsWriteProtected()) Rtc.SetIsWriteProtected(false);
+  if (!Rtc.GetIsRunning()) Rtc.SetIsRunning(true);
 
-    // --------------------------------------------------------
-    // Initialisation OLED
-    // --------------------------------------------------------
+  // Initialisation OLEDs
+  ecran1.begin();
+  ecran2.begin();
 
-    u8g2_1.begin();
-    u8g2_2.begin();
+  // Initialisation EEPROM
+  initialiserEEPROM();
 
-    // --------------------------------------------------------
-    // Initialisation RTC
-    // --------------------------------------------------------
+  for (byte i = 0; i < LARGEUR_TRACE; i++) {
+    bufferPPG[i] = 0;
+  }
 
-    Rtc.Begin();
-
-    // --------------------------------------------------------
-    // Initialisation filtre
-    // --------------------------------------------------------
-
-    int initialValue = analogRead(ppgPin);
-
-    for (int i = 0; i < FILTER_SIZE; i++) {
-
-        filterBuffer[i] = initialValue;
-        filterSum += initialValue;
-    }
-
-    signalAverage = initialValue;
-
-    // --------------------------------------------------------
-    // Graphique
-    // --------------------------------------------------------
-
-    for (int i = 0; i < GRAPH_WIDTH; i++) {
-        graphValues[i] = initialValue;
-    }
-
-    // --------------------------------------------------------
-    // EEPROM
-    // --------------------------------------------------------
-
-    loadEEPROM();
-
-    // --------------------------------------------------------
-    // Encodeur
-    // --------------------------------------------------------
-
-    lastEncA = digitalRead(pinEncA);
+  Serial.println(F("=== SYSTEME CARDIO INTEGRE OPERATIONNEL ==="));
 }
 
-// ============================================================
-// LOOP
-// ============================================================
-
+// =============================================================================
+// 10. BOUCLE PRINCIPALE NON-BLOQUANTE (LOOP)
+// =============================================================================
 void loop() {
+  unsigned long maintenant = millis();
 
-    // Lecture PPG
-    processPPG();
+  // ---------------------------------------------------------------------------
+  // A. FS1 : TRAITEMENT DU SIGNAL PPG (Version exacte et robuste FS1)
+  // ---------------------------------------------------------------------------
+  if (maintenant - derniereLecturePPG >= PERIODE_ECH_MS) {
+    derniereLecturePPG = maintenant;
 
-    // Encodeur
-    processEncoder();
+    int brut = analogRead(PIN_PPG);
+    if (!ppgInitialise) {
+      signalLisse = brut;
+      ligneBase   = brut;
+      ppgInitialise = true;
+    }
 
-    // Bouton D9
-    processMainButton();
+    // Filtrage récursif conforme FS1
+    signalLisse += ALPHA_LISSE * (brut - signalLisse);
+    ligneBase   += ALPHA_BASE * (signalLisse - ligneBase);
+    float ac = signalLisse - ligneBase;
 
-    // Bouton de l'encodeur D11
-    processEncoderButton();
+    // Plage de détection élargie pour ne pas rejeter le doigt
+    doigtPresent = (brut > 30 && brut < 1010);
 
-    // Affichage
-    drawScreen1();
-    drawScreen2();
+    // Suivi d'enveloppe crête
+    if (ac > creteMax) {
+      creteMax = ac;
+    } else {
+      creteMax *= ALPHA_DECAY;
+      if (creteMax < 5.0f) creteMax = 5.0f;
+    }
 
-    delay(2);
+    // Normalisation continue [0.0 ; 1.0] pour l'oscilloscope
+    if (ac > 0.0f) {
+      signalNorm = ac / creteMax;
+      if (signalNorm > 1.0f) signalNorm = 1.0f;
+    } else {
+      signalNorm = 0.0f;
+    }
+
+    // Détection des battements cardiaques
+    if (!enPic) {
+      if (signalNorm > SEUIL_HAUT && (maintenant - tempsDernierBattement > TEMPS_REFRACTAIRE_MS) && doigtPresent) {
+        enPic = true;
+        unsigned long deltaT = maintenant - tempsDernierBattement;
+        tempsDernierBattement = maintenant;
+
+        if (deltaT >= TEMPS_REFRACTAIRE_MS && deltaT <= 1600) {
+          float bpmInst = 60000.0f / (float)deltaT;
+          bool valide = true;
+          if (bpmFinal > 35.0f) {
+            float ecart = abs(bpmInst - bpmFinal);
+            if (ecart > (bpmFinal * 0.35f)) valide = false;
+          }
+
+          if (valide) {
+            buffBpm[indexBuffBpm] = bpmInst;
+            indexBuffBpm = (indexBuffBpm + 1) % TAILLE_BUFF_BPM;
+            float somme = 0;
+            byte compte = 0;
+            for (byte i = 0; i < TAILLE_BUFF_BPM; i++) {
+              if (buffBpm[i] > 0) {
+                somme += buffBpm[i];
+                compte++;
+              }
+            }
+            if (compte > 0) bpmFinal = somme / compte;
+
+            // Bip sonore synchronisé
+            declencherBip(bpmFinal);
+          }
+        }
+      }
+    } else {
+      if (signalNorm < SEUIL_BAS) {
+        enPic = false; // Réarmement
+      }
+    }
+
+    if (!doigtPresent) {
+      bpmFinal = 0.0f;
+    }
+
+    // Mise à jour voyant LED d'état de santé
+    actualiserEtatSante();
+  }
+
+  // ---------------------------------------------------------------------------
+  // B. FS3 & FS4 : PILOTAGE PHYSIQUE DES ACTIONNEURS
+  // ---------------------------------------------------------------------------
+  piloterLedRGB();
+  gererFinBip();
+
+  // Bouton Mute FS4 (D9)
+  bool lectureMute = digitalRead(PIN_BOUTON_MUTE);
+  if (lectureMute != dernierEtatMute && (maintenant - dernierDebounceMute > 50)) {
+    if (lectureMute == LOW) {
+      sonActive = !sonActive;
+      if (!sonActive) {
+        noTone(PIN_BUZZER);
+        sonEnCours = false;
+      }
+    }
+    dernierDebounceMute = maintenant;
+  }
+  dernierEtatMute = lectureMute;
+
+  // ---------------------------------------------------------------------------
+  // C. FS5 & FS6 : GESTION DE L'ENCODEUR ROTATIF (AXE ET ROTATION)
+  // ---------------------------------------------------------------------------
+  if (deltaEncodeur != 0) {
+    if (modeActuel == MODE_HISTORIQUE && nbMesuresStockees > 0) {
+      indexHistorique += deltaEncodeur;
+      if (indexHistorique < 0) indexHistorique = 0;
+      if (indexHistorique >= nbMesuresStockees) indexHistorique = nbMesuresStockees - 1;
+    } else if (modeActuel == MODE_OPTIONS) {
+      optionSelectionnee = (optionSelectionnee == 0) ? 1 : 0;
+    }
+    deltaEncodeur = 0;
+  }
+
+  // Lecture continue de l'axe poussoir de l'encodeur (D11)
+  bool lectureSW = digitalRead(PIN_ENC_SW);
+  if (lectureSW == LOW) {
+    if (!boutonEstEnfonce) {
+      boutonEstEnfonce = true;
+      tempsDebutEnfonce = maintenant;
+    }
+    dureeAppuiCourante = maintenant - tempsDebutEnfonce;
+  } else {
+    if (boutonEstEnfonce) {
+      unsigned long dureeTotale = maintenant - tempsDebutEnfonce;
+      boutonEstEnfonce = false;
+      dureeAppuiCourante = 0;
+
+      if (dureeTotale >= SEUIL_APPUI_LONG_MS) {
+        // Appui long (>= 6s)
+        if (modeActuel == MODE_NORMAL && !acquisitionEnCours) {
+          acquisitionEnCours = true;
+          compteurEchantillons = 0;
+          sommeBpm = 0;
+        } else if (modeActuel == MODE_OPTIONS) {
+          if (optionSelectionnee == 0) {
+            langueActive = (langueActive == FR) ? EN : FR;
+            EEPROM.write(ADRESSE_LANGUE, (uint8_t)langueActive);
+          } else {
+            effacerHistoriqueEEPROM();
+          }
+        }
+      } else if (dureeTotale >= SEUIL_APPUI_COURT_MS) {
+        // Appui court (2s à 6s)
+        if (modeActuel == MODE_NORMAL) {
+          modeActuel = MODE_HISTORIQUE;
+        } else if (modeActuel == MODE_HISTORIQUE) {
+          modeActuel = MODE_OPTIONS;
+        } else {
+          modeActuel = MODE_NORMAL;
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // D. FS6 : CALCUL DE LA MOYENNE SUR 10 POINTS ET STOCKAGE
+  // ---------------------------------------------------------------------------
+  if (acquisitionEnCours && (maintenant - dernierEchantillonMoyenne >= 140)) {
+    dernierEchantillonMoyenne = maintenant;
+    int bpmInst = (bpmFinal > 0) ? (int)(bpmFinal + 0.5f) : 70;
+    sommeBpm += bpmInst;
+    compteurEchantillons++;
+
+    if (compteurEchantillons >= 10) {
+      uint8_t bpmMoyen = (uint8_t)(sommeBpm / 10);
+      acquisitionEnCours = false;
+      sauvegarderMesure(bpmMoyen, Rtc.GetDateTime());
+      indexHistorique = nbMesuresStockees - 1;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // E. FS5 : ACQUISITION DE L'OSCILLOSCOPE SELON LA BASE DE TEMPS
+  // ---------------------------------------------------------------------------
+  unsigned int dt = ECHELLES_MS[indexEchelle];
+  while (maintenant - dernierTempsTrace >= dt) {
+    dernierTempsTrace += dt;
+    // Injection du signal PPG normalisé réel de FS1
+    uint8_t pixelH = (uint8_t)(signalNorm * (HAUTEUR_TRACE - 2));
+    bufferPPG[indexTrace] = pixelH;
+    indexTrace = (indexTrace + 1) % LARGEUR_TRACE;
+  }
+
+  // ---------------------------------------------------------------------------
+  // F. RAFRAÎCHISSEMENT DES DEUX ÉCRANS OLED
+  // ---------------------------------------------------------------------------
+ // Écran 1 (Heure & BPM) : rafraîchi toutes les 500 ms (suffisant pour les secondes)
+  if (maintenant - dernierAffichageHeure >= 500) {
+    dernierAffichageHeure = maintenant;
+    RtcDateTime dtRTC = Rtc.GetDateTime();
+    snprintf(strHeure, sizeof(strHeure), "%02d:%02d:%02d", dtRTC.Hour(), dtRTC.Minute(), dtRTC.Second());
+    dessinerEcran1();
+  }
+
+  // Écran 2 (Oscilloscope PPG) : rafraîchi toutes les 90 ms (~11 FPS, libère du temps CPU)
+  if (maintenant - dernierAffichagePPG >= 90) {
+    dernierAffichagePPG = maintenant;
+    dessinerEcran2();
+  }
+
+  // Écran 2 (Oscilloscope PPG) : rafraîchi à ~15 FPS
+  if (maintenant - dernierAffichagePPG >= 65) {
+    dernierAffichagePPG = maintenant;
+    dessinerEcran2();
+  }
 }
